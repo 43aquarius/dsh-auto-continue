@@ -53,7 +53,10 @@ const DEFAULTS = {
 	cooldownRateLimitMs: 300000,
 	cooldownAuthMs: 21600000,
 	cooldownTransientMs: 120000,
-	healthyTtlMs: 600000
+	healthyTtlMs: 600000,
+	resumeOnErrorIdle: true,
+	maxIdleResumes: 3,
+	cooldownModelFaultMs: 1800000
 };
 
 /** Candidate host node_modules roots (Electron app tree, newest first). */
@@ -98,6 +101,18 @@ try {
 	z = (await importHost("@deepseek-ai/schemastery"))?.default;
 } catch {}
 
+/**
+ * Host dsh-session, loaded defensively. Its appendPluginRecord() commits a
+ * plugin record: an event envelope with ignorable:true whose type follows the
+ * "plugin:" grammar. Plain session.append() would write a type outside the
+ * harness vocabulary WITHOUT that marker, and the persistence read path then
+ * refuses the whole session log at load time (SessionFormatError).
+ */
+let dshSession;
+try {
+	dshSession = (await importHost("@deepseek-ai/dsh-session")) ?? {};
+} catch {}
+
 /** Hand-rolled last-resort user message when dsh-llm is unavailable. */
 let handRolledCounter = 0;
 function anyUserMessage(text) {
@@ -129,11 +144,16 @@ if (z) {
 		cooldownRateLimitMs: z.number().default(DEFAULTS.cooldownRateLimitMs).description("限流路由的冷却时间（毫秒）"),
 		cooldownAuthMs: z.number().default(DEFAULTS.cooldownAuthMs).description("鉴权/凭证错误路由的冷却时间（毫秒）"),
 		cooldownTransientMs: z.number().default(DEFAULTS.cooldownTransientMs).description("其他临时错误路由的冷却时间（毫秒）"),
-		healthyTtlMs: z.number().default(DEFAULTS.healthyTtlMs).description("探测成功结果的缓存时长（毫秒）")
+		healthyTtlMs: z.number().default(DEFAULTS.healthyTtlMs).description("探测成功结果的缓存时长（毫秒）"),
+		resumeOnErrorIdle: z.boolean().default(DEFAULTS.resumeOnErrorIdle).description("回合以错误收尾且没有排定续接时，空闲后自动兜底续接（覆盖 request-error 之外的失败）"),
+		maxIdleResumes: z.number().default(DEFAULTS.maxIdleResumes).description("每个会话在每个宿主生命周期内兜底续接的最大次数"),
+		cooldownModelFaultMs: z.number().default(DEFAULTS.cooldownModelFaultMs).description("模型级持续故障（PI_AI_ERROR/MODEL_SWITCH_COMPACTION_FAILED 等）的冷却时间（毫秒）")
 	});
 }
 
-const QUOTA_CODES = new Set(["QUOTA", "ACCOUNT_QUOTA"]);
+const QUOTA_CODES = new Set(["QUOTA", "ACCOUNT_QUOTA", "QUOTA_EXCEEDED", "QUOTA_EXHAUSTED"]);
+/** Model-level persistent faults: the route stays broken across turns, so a long cooldown applies. */
+const MODEL_FAULT_CODES = new Set(["PI_AI_ERROR", "MODEL_SWITCH_COMPACTION_FAILED"]);
 const AUTH_CODES = new Set(["AUTH", "INVALID_CREDENTIAL", "MISSING_CREDENTIAL"]);
 
 export async function apply(ctx, rawConfig) {
@@ -145,10 +165,34 @@ export async function apply(ctx, rawConfig) {
 	const healthy = new Map();
 	/** agent id -> Map<turn, count> — bounds switching within one turn. */
 	const switches = new Map();
+	/** agent id -> { code, message, at, attempts } — error-ended turns awaiting an idle resume. */
+	const pendingResume = new Map();
+	/** agent id -> idle-resume attempts consumed this host lifetime. */
+	const idleResumes = new Map();
+
+	const SWITCH_RECORD_TYPE = "plugin:auto-continue/switch";
+	/** Record a model switch via the plugin-record path; never via plain append(). */
+	function recordSwitch(agent, record) {
+		try {
+			if (typeof dshSession?.appendPluginRecord === "function") {
+				dshSession.appendPluginRecord(agent.session, SWITCH_RECORD_TYPE, record);
+				return;
+			}
+			if (agent.session && typeof agent.session.appendPluginRecord === "function") {
+				agent.session.appendPluginRecord(SWITCH_RECORD_TYPE, record);
+				return;
+			}
+		} catch (error) {
+			ctx.logger.warn(`auto-continue: switch record failed; skipped (${error instanceof Error ? error.message : String(error)})`);
+			return;
+		}
+		ctx.logger.warn("auto-continue: appendPluginRecord unavailable in this host; switch record skipped");
+	}
 
 	const routeKey = (provider, model) => `${provider}/${model}`;
 
 	function cooldownMsFor(code, providerRetryAfterMs) {
+		if (MODEL_FAULT_CODES.has(code)) return config.cooldownModelFaultMs;
 		if (QUOTA_CODES.has(code)) return config.cooldownQuotaMs;
 		if (AUTH_CODES.has(code)) return config.cooldownAuthMs;
 		if (code === "RATE_LIMIT") {
@@ -290,14 +334,18 @@ export async function apply(ctx, rawConfig) {
 		}
 		if (!chosen) {
 			ctx.logger.warn(`auto-continue: no usable fallback for "${failedProvider}/${failedModel}" (${code}); surfacing the error`);
+			if (config.resumeOnErrorIdle) {
+				const prior = pendingResume.get(agent.id);
+				pendingResume.set(agent.id, { code, message: failure.message, at: Date.now(), attempts: prior?.attempts ?? 0 });
+			}
 			return next();
 		}
 
 		// 1. Durable model switch — the next step picks it up and the loop renders
 		//    its own "[model changed: ...]" notice.
 		agent.model.select({ provider: chosen.provider, model: chosen.model });
-		// 2. Durable observability record.
-		agent.session.append("auto-continue/switch", {
+		// 2. Durable observability record — plugin-record path only (ignorable:true).
+		recordSwitch(agent, {
 			turn,
 			step,
 			from: { provider: failedProvider, model: failedModel },
@@ -310,17 +358,100 @@ export async function apply(ctx, rawConfig) {
 		// 4. Queue the continuation message; the latched wake restarts the driver
 		//    and the new turn claims it on the new model.
 		agent.followup(anyUserMessage(config.continuationText));
+		pendingResume.delete(agent.id);
 		turns.set(turn, used + 1);
 		ctx.logger.info(`auto-continue: "${failedProvider}/${failedModel}" failed (${code}); switched to "${chosen.provider}/${chosen.model}" and queued continuation for turn ${turn}`);
 		return next();
 	}
 
+	/**
+	 * Idle-resume a turn that ended in error without a queued continuation:
+	 * driver-level failures and exhausted-fallback request errors both land
+	 * here. LLM-side faults first probe-and-switch; driver faults only
+	 * continue (the model itself was never the problem).
+	 */
+	async function resumeIdle(agent, pending) {
+		if (typeof agent.model?.select !== "function" || typeof agent.followup !== "function") return;
+		if (pending.code === "DRIVER_ERROR") {
+			agent.followup(anyUserMessage(config.continuationText));
+			const used = idleResumes.get(agent.id) ?? 0;
+			idleResumes.set(agent.id, used + 1);
+			ctx.logger.info(`auto-continue: idle resume after driver error (${pending.message}); queued continuation`);
+			return;
+		}
+		const current = agent.model.current();
+		// Idle resume probes ignore cooldowns: it is a low-frequency retry window,
+		// and cooldown-blocked candidates would leave the session stranded forever.
+		const pool = await listCandidates(current?.provider, current?.model, pending.code);
+		for (const candidate of pool) {
+			if (lifetime.signal.aborted) return;
+			const verdict = await probeRoute(candidate, undefined);
+			if (lifetime.signal.aborted) return;
+			if (verdict.ok) {
+				healthy.set(routeKey(candidate.provider, candidate.model), { until: Date.now() + config.healthyTtlMs });
+				if (current?.provider && current?.model) {
+					agent.model.select({ provider: candidate.provider, model: candidate.model });
+					recordSwitch(agent, { source: "idle-resume", from: { provider: current.provider, model: current.model }, to: { provider: candidate.provider, model: candidate.model }, failure: { code: pending.code, message: pending.message } });
+				}
+				agent.followup(anyUserMessage(config.continuationText));
+				const used = idleResumes.get(agent.id) ?? 0;
+				idleResumes.set(agent.id, used + 1);
+				ctx.logger.info(`auto-continue: idle resume switched to "${candidate.provider}/${candidate.model}" (was ${pending.code})`);
+				return;
+			}
+			markRoute(candidate.provider, candidate.model, verdict.code, verdict.providerRetryAfterMs);
+			ctx.logger.warn(`auto-continue: idle-resume probe "${routeKey(candidate.provider, candidate.model)}" failed (${verdict.code})`);
+		}
+		ctx.logger.warn(`auto-continue: idle resume found no healthy model (${pending.code}); will retry on the next idle`);
+		const prior = pendingResume.get(agent.id);
+		pendingResume.set(agent.id, { ...pending, attempts: (prior?.attempts ?? 0) + 1 });
+	}
+
 	const disposeRequestError = ctx.on("agent/request-error", (payload, next) => recover(payload, next));
+	// A normally-ending turn (completed / user stop / queued followup) cancels any pending resume.
+	const disposeTurnStopping = ctx.on("agent/turn-stopping", (payload, next) => {
+		const agentId = payload?.agent?.id;
+		if (agentId) pendingResume.delete(agentId);
+		return typeof next === "function" ? next() : undefined;
+	});
+	// Driver-level failures (tool explosions, loop crashes) also deserve a resume.
+	const disposeAgentError = ctx.on("agent/error", (payload, next) => {
+		const agent = payload?.agent;
+		const error = payload?.error;
+		if (!agent || config.resumeOnErrorIdle === false) return typeof next === "function" ? next() : undefined;
+		if (/abort/i.test(String(error?.name ?? ""))) return typeof next === "function" ? next() : undefined;
+		const prior = pendingResume.get(agent.id);
+		pendingResume.set(agent.id, { code: "DRIVER_ERROR", message: String(error?.message ?? error).slice(0, 200), at: Date.now(), attempts: prior?.attempts ?? 0 });
+		return typeof next === "function" ? next() : undefined;
+	});
+	// When the agent goes idle with an unresolved error tail, resume it once.
+	const disposeStatus = ctx.on("agent/status", (payload, next) => {
+		const agent = payload?.agent;
+		if (!agent || payload.status !== "idle" || config.resumeOnErrorIdle === false) return typeof next === "function" ? next() : undefined;
+		const pending = pendingResume.get(agent.id);
+		if (!pending) return typeof next === "function" ? next() : undefined;
+		const used = idleResumes.get(agent.id) ?? 0;
+		if (used >= config.maxIdleResumes) {
+			ctx.logger.warn(`auto-continue: session "${agent.id}" already idle-resumed ${used} times this lifetime; giving up`);
+			pendingResume.delete(agent.id);
+			return typeof next === "function" ? next() : undefined;
+		}
+		pendingResume.delete(agent.id);
+		void resumeIdle(agent, pending).catch((error) => {
+			ctx.logger.warn(`auto-continue: idle resume failed: ${error instanceof Error ? error.message : String(error)}`);
+		});
+		return typeof next === "function" ? next() : undefined;
+	});
 	const disposeDisposed = ctx.on("agent/disposed", ({ agent }) => {
 		switches.delete(agent.id);
+		pendingResume.delete(agent.id);
+		idleResumes.delete(agent.id);
 	});
 	ctx.effect(() => async () => {
 		disposeRequestError();
+		disposeTurnStopping();
+		disposeAgentError();
+		disposeStatus();
 		disposeDisposed();
 		lifetime.abort(new Error("auto-continue plugin disposed"));
 	}, "auto-continue: dispose listeners");

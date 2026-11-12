@@ -39,7 +39,7 @@ function makeLlm({ stormRaccoon = true } = {}) {
 }
 
 function makeAgent(overrides = {}) {
-	const record = { selects: [], cancels: [], followups: [], sessionEvents: [] };
+	const record = { selects: [], cancels: [], followups: [], sessionEvents: [], appendEvents: [] };
 	const agent = {
 		id: "session-test",
 		model: {
@@ -52,8 +52,12 @@ function makeAgent(overrides = {}) {
 		},
 		session: {
 			append(type, data) {
+				record.appendEvents.push({ type, data });
+				return { seq: record.appendEvents.length };
+			},
+			appendPluginRecord(type, data) {
 				record.sessionEvents.push({ type, data });
-				return { seq: record.sessionEvents.length };
+				return record.sessionEvents.length;
 			}
 		},
 		cancel(cause, options) {
@@ -114,8 +118,9 @@ async function run() {
 		assert.strictEqual(record.followups[0].role, "user", "followup is a user message");
 		const contText = record.followups[0].content[0].text;
 		assert.ok(contText.includes("继续"), "continuation text present: " + contText);
-		const switchEvent = record.sessionEvents.find((e) => e.type === "auto-continue/switch");
-		assert.ok(switchEvent, "auto-continue/switch session event recorded");
+		const switchEvent = record.sessionEvents.find((e) => e.type === "plugin:auto-continue/switch");
+		assert.ok(switchEvent, "plugin:auto-continue/switch session event recorded");
+		assert.deepStrictEqual(record.appendEvents, [], "no raw session.append() calls — ignorable plugin records only");
 		assert.strictEqual(switchEvent.data.from.provider, "raccoon-vision");
 		assert.strictEqual(switchEvent.data.to.provider, record.selects[0].provider);
 		console.log("SCENARIO 1 PASS — switched to", record.selects[0].provider + "/" + record.selects[0].model, "| probes:", JSON.stringify(llm.probeLog));
@@ -203,6 +208,94 @@ async function run() {
 		assert.strictEqual(record.selects[0].provider, "loomy", "chain order honored: " + JSON.stringify(record.selects[0]));
 		// QUOTA cooldown: quota code => QUOTA branch (30min)
 		console.log("SCENARIO 4 PASS — explicit chain honored (loomy first)");
+	}
+
+	// ---- Scenario 5: all-storm request error -> idle resume once models recover
+	{
+		const llm = makeLlm({ stormRaccoon: false });
+		const probeAll = [];
+		llm.stream = async function* (options) {
+			probeAll.push(options.provider + "/" + options.model);
+			yield { type: "finish", reason: { kind: "error", failure: { code: "RATE_LIMIT", message: "429", status: 429 } } };
+		};
+		const listeners = {};
+		const ctx = {
+			llm,
+			logger: { info() {}, warn() {}, error() {} },
+			on(name, listener) { listeners[name] = listener; return () => {}; },
+			effect() {}
+		};
+		await mod.apply(ctx, {});
+		const { agent, record } = makeAgent();
+		await listeners["agent/request-error"](
+			{ agent, turn: 1, step: 1, provider: "raccoon-vision", failure: { code: "RATE_LIMIT", message: "429" }, signal: new AbortController().signal },
+			async () => undefined
+		);
+		assert.strictEqual(record.selects.length, 0, "no switch while every candidate storms");
+		assert.strictEqual(record.followups.length, 0, "no followup while every candidate storms");
+		// models recover
+		llm.stream = async function* (options) {
+			probeAll.push(options.provider + "/" + options.model);
+			yield { type: "text-delta", index: 0, text: "ok" };
+			yield { type: "finish", reason: { kind: "stop" } };
+		};
+		await listeners["agent/status"]({ agent, status: "idle" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.strictEqual(record.selects.length, 1, "idle resume switched once: " + JSON.stringify(record.selects));
+		assert.notStrictEqual(record.selects[0].provider, "raccoon-vision", "idle resume left the failed provider");
+		assert.strictEqual(record.followups.length, 1, "idle resume queued continuation");
+		const swEv = record.sessionEvents.find((e) => e.type === "plugin:auto-continue/switch");
+		assert.ok(swEv, "idle resume also records a plugin switch record");
+		assert.strictEqual(swEv.data.source, "idle-resume", "switch record tagged as idle-resume");
+		console.log("SCENARIO 5 PASS — idle resume switched to", record.selects[0].provider + "/" + record.selects[0].model);
+	}
+
+	// ---- Scenario 6: turn-stopping (normal end) cancels the pending resume
+	{
+		const llm = makeLlm({ stormRaccoon: false });
+		llm.stream = async function* () {
+			yield { type: "finish", reason: { kind: "error", failure: { code: "RATE_LIMIT", message: "429" } } };
+		};
+		const listeners = {};
+		const ctx = {
+			llm,
+			logger: { info() {}, warn() {}, error() {} },
+			on(name, listener) { listeners[name] = listener; return () => {}; },
+			effect() {}
+		};
+		await mod.apply(ctx, {});
+		const { agent, record } = makeAgent();
+		await listeners["agent/request-error"](
+			{ agent, turn: 1, step: 1, provider: "raccoon-vision", failure: { code: "RATE_LIMIT", message: "429" }, signal: new AbortController().signal },
+			async () => undefined
+		);
+		await listeners["agent/turn-stopping"]({ agent, turn: 1 });
+		await listeners["agent/status"]({ agent, status: "idle" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.strictEqual(record.selects.length, 0, "turn-stopping cancelled the pending resume");
+		assert.strictEqual(record.followups.length, 0, "no continuation after normal stop");
+		console.log("SCENARIO 6 PASS — turn-stopping cancels pending resume");
+	}
+
+	// ---- Scenario 7: driver error -> idle resume continues without switching
+	{
+		const llm = makeLlm({ stormRaccoon: false });
+		const listeners = {};
+		const ctx = {
+			llm,
+			logger: { info() {}, warn() {}, error() {} },
+			on(name, listener) { listeners[name] = listener; return () => {}; },
+			effect() {}
+		};
+		await mod.apply(ctx, {});
+		const { agent, record } = makeAgent();
+		await listeners["agent/error"]({ agent, turn: 2, step: 3, error: new Error("tool batch exploded") });
+		await listeners["agent/status"]({ agent, status: "idle" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.strictEqual(record.followups.length, 1, "driver error resumes with a continuation");
+		assert.strictEqual(record.selects.length, 0, "driver error does not switch models");
+		assert.strictEqual(record.followups[0].content[0].text.includes("继续"), true, "continuation text present");
+		console.log("SCENARIO 7 PASS — driver error resumed without switching");
 	}
 
 	console.log("\nALL SCENARIOS PASS");

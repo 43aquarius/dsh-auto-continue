@@ -18,6 +18,7 @@
 4. **持久切换**：`agent.model.select()` 写入 `model/selection` 会话事件——与 Web UI 手动切换完全同一机制，下一步自动出现 `[model changed: ...]` 通知。
 5. **自动续接**：以 hook 原因中止死回合（保留已排队的输入），向 next-turn 收件箱补发一条「继续」；循环的唤醒闩锁自动开新回合，在新模型上原地续跑任务。
 6. **防失控**：单回合最多切换 3 次（可配）；上下文超限（`CONTEXT_WINDOW_EXCEEDED`）会优先挑上下文窗口更大的模型；全死时不切，如实上报错误。
+7. **兜底续接（v1.1.0）**：任何回合以错误收尾后——包括驱动级异常、重试耗尽仍无可用候选等「不明原因」中断——一旦会话空闲即自动重新探活并续接（受 `maxIdleResumes` 上限约束）；正常结束或用户手动停止则绝不打扰。
 
 ## 安装
 
@@ -43,18 +44,21 @@
 | `cooldownAuthMs` | `21600000` | 凭证错误路由的冷却时间 |
 | `cooldownTransientMs` | `120000` | 其他临时错误路由的冷却时间 |
 | `healthyTtlMs` | `600000` | 探测成功结果的缓存时长 |
+| `resumeOnErrorIdle` | `true` | 回合错误收尾且无排定续接时，空闲后自动兜底续接 |
+| `maxIdleResumes` | `3` | 每个会话在每个宿主生命周期内兜底续接的最大次数 |
+| `cooldownModelFaultMs` | `1800000` | 模型级持续故障（PI_AI_ERROR、切换压缩失败等）的冷却时间 |
 
 ## 验证
 
 - 9 个对照会话（含 teammates 与子代理）在健康路由下零干扰。
 - 真实 429 限流风暴压测：`dsh-llm-retry` 退避重试 5 次耗尽后，插件逐个探测候选；峰值全 429 时如实上报错误、不切死模型；风暴过后探测命中健康候选即完成切换。
-- 确定性单元测试（`test/switch.test.mjs`，4 个场景）覆盖完整切换链路与边界。
+- 确定性单元测试（`test/switch.test.mjs`，7 个场景）覆盖完整切换链路、空闲兜底续接、正常收尾取消挂起与驱动错误续接。
 
 ## English
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that automatically recovers interrupted sessions: when a model request fails (quota exhausted, rate limit, reset windows, credential errors, context overflow), it probes the registered model catalog for a healthy fallback, durably switches the session via the same `model/selection` mechanism as the UI, and queues a continuation message so the task resumes on the new model — no manual intervention.
 
-Short same-model backoff retries remain the job of the bundled `dsh-llm-retry` plugin; this plugin takes over once retries are exhausted or the failure is terminal. See the configuration table above (defaults are sane; everything is tunable).
+Short same-model backoff retries remain the job of the bundled `dsh-llm-retry` plugin; this plugin takes over once retries are exhausted or the failure is terminal. Since v1.1.0 it also covers every other kind of interruption: driver-level failures and exhausted-fallback errors are resumed automatically once the agent goes idle (bounded by `maxIdleResumes`), and model-level persistent faults (e.g. `PI_AI_ERROR`, compaction failures during a switch) get a long 30-minute cooldown. Switch records are committed via `session.appendPluginRecord()` with the `plugin:` envelope grammar so they never poison the session log. See the configuration table above (defaults are sane; everything is tunable).
 
 ## License
 
