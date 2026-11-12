@@ -101,11 +101,12 @@ try {
 /** Hand-rolled last-resort user message when dsh-llm is unavailable. */
 let handRolledCounter = 0;
 function anyUserMessage(text) {
-	if (createUserMessage) return createUserMessage({ content: [{ type: "text", text }] });
+	if (createUserMessage) return createUserMessage({ source: { kind: "user" }, content: [{ type: "text", text }] });
 	handRolledCounter += 1;
 	return {
 		id: `auto-continue-${Date.now().toString(36)}-${handRolledCounter}`,
 		role: "user",
+		source: { kind: "user" },
 		content: [{ type: "text", text }]
 	};
 }
