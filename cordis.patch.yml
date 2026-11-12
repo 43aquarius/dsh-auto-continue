@@ -1,0 +1,4 @@
+- insert:
+    - id: auto-continue
+      name: 'dsh-auto-continue'
+      config: {}

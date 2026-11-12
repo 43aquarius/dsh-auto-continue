@@ -1,0 +1,51 @@
+{
+  "name": "dsh-auto-continue",
+  "description": "Auto-continue interrupted sessions: probe an available fallback model, switch durably, and resume the task automatically",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "43aquarius"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/43aquarius/dsh-auto-continue.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "auto-continue",
+    "model-switch",
+    "fallback",
+    "rate-limit"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "test/",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.1.0",
+    "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1",
+    "@deepseek-ai/schemastery": ">=3.19.0"
+  }
+}

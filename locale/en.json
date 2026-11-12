@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Auto continue and model switch",
+    "description": "When a model request fails (quota exhausted, rate limit, reset windows, credential errors), probes an available fallback model, switches the session to it durably, and resumes the interrupted task automatically."
+  }
+}
