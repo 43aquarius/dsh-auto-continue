@@ -56,7 +56,9 @@ const DEFAULTS = {
 	healthyTtlMs: 600000,
 	resumeOnErrorIdle: true,
 	maxIdleResumes: 3,
-	cooldownModelFaultMs: 1800000
+	cooldownModelFaultMs: 1800000,
+	preferLargeContext: true,
+	minContextWindow: 0
 };
 
 /** Candidate host node_modules roots (Electron app tree, newest first). */
@@ -147,13 +149,17 @@ if (z) {
 		healthyTtlMs: z.number().default(DEFAULTS.healthyTtlMs).description("探测成功结果的缓存时长（毫秒）"),
 		resumeOnErrorIdle: z.boolean().default(DEFAULTS.resumeOnErrorIdle).description("回合以错误收尾且没有排定续接时，空闲后自动兜底续接（覆盖 request-error 之外的失败）"),
 		maxIdleResumes: z.number().default(DEFAULTS.maxIdleResumes).description("每个会话在每个宿主生命周期内兜底续接的最大次数"),
-		cooldownModelFaultMs: z.number().default(DEFAULTS.cooldownModelFaultMs).description("模型级持续故障（PI_AI_ERROR/MODEL_SWITCH_COMPACTION_FAILED 等）的冷却时间（毫秒）")
+		cooldownModelFaultMs: z.number().default(DEFAULTS.cooldownModelFaultMs).description("模型级持续故障（PI_AI_ERROR/MODEL_SWITCH_COMPACTION_FAILED 等）的冷却时间（毫秒）"),
+		preferLargeContext: z.boolean().default(DEFAULTS.preferLargeContext).description("切换时优先选择上下文窗口足够大的模型，避免切过去触发历史压缩（压缩摘要仍用旧模型，旧模型限流时会失败）"),
+		minContextWindow: z.number().default(DEFAULTS.minContextWindow).description("候选模型的最小上下文窗口（token，0=不限制）；低于此值的模型不作为切换目标")
 	});
 }
 
 const QUOTA_CODES = new Set(["QUOTA", "ACCOUNT_QUOTA", "QUOTA_EXCEEDED", "QUOTA_EXHAUSTED"]);
 /** Model-level persistent faults: the route stays broken across turns, so a long cooldown applies. */
-const MODEL_FAULT_CODES = new Set(["PI_AI_ERROR", "MODEL_SWITCH_COMPACTION_FAILED"]);
+const MODEL_FAULT_CODES = new Set(["PI_AI_ERROR"]);
+/** Switch/compaction failures are transitions, not broken routes: short cooldown only, and always eligible for large-window selection. */
+const SWITCH_TRANSITION_CODES = new Set(["MODEL_SWITCH_COMPACTION_FAILED"]);
 const AUTH_CODES = new Set(["AUTH", "INVALID_CREDENTIAL", "MISSING_CREDENTIAL"]);
 
 export async function apply(ctx, rawConfig) {
@@ -192,6 +198,7 @@ export async function apply(ctx, rawConfig) {
 	const routeKey = (provider, model) => `${provider}/${model}`;
 
 	function cooldownMsFor(code, providerRetryAfterMs) {
+		if (SWITCH_TRANSITION_CODES.has(code)) return Math.min(config.cooldownTransientMs, 60000);
 		if (MODEL_FAULT_CODES.has(code)) return config.cooldownModelFaultMs;
 		if (QUOTA_CODES.has(code)) return config.cooldownQuotaMs;
 		if (AUTH_CODES.has(code)) return config.cooldownAuthMs;
@@ -215,7 +222,7 @@ export async function apply(ctx, rawConfig) {
 	}
 
 	/** Enumerate fallback candidates: explicit chain first, then the full registry. */
-	async function listCandidates(excludeProvider, excludeModel, failureCode) {
+	async function listCandidates(excludeProvider, excludeModel, failureCode, currentWindow) {
 		const ordered = [];
 		const seen = new Set();
 		const push = (provider, model, contextWindow) => {
@@ -243,10 +250,46 @@ export async function apply(ctx, rawConfig) {
 			// registry unavailable; the explicit chain still applies
 		}
 		let list = ordered.filter((candidate) => !(candidate.provider === excludeProvider && candidate.model === excludeModel));
-		if (failureCode === "CONTEXT_WINDOW_EXCEEDED") {
-			list = [...list].sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
+		const minWindow = Math.max(0, Number(config.minContextWindow) || 0);
+		if (minWindow > 0) {
+			list = list.filter((candidate) => (candidate.contextWindow ?? 0) >= minWindow);
+		}
+		// A model switch may trigger context compaction, whose summary uses the
+		// PREVIOUS routed model. If the previous model is the one that is failing,
+		// compaction fails and the harness refuses the switch with
+		// MODEL_SWITCH_COMPACTION_FAILED, so prefer a destination whose window is
+		// at least as large as the current one (no compaction needed at all).
+		const wantLarge = config.preferLargeContext === true || failureCode === "CONTEXT_WINDOW_EXCEEDED" || MODEL_FAULT_CODES.has(failureCode) || SWITCH_TRANSITION_CODES.has(failureCode);
+		if (wantLarge && Number.isFinite(currentWindow) && currentWindow > 0) {
+			// Destinations smaller than the current window force compaction, whose
+			// summary uses the failing previous model — a guaranteed dead end.
+			const largeEnough = list.filter((c) => (c.contextWindow ?? 0) >= currentWindow);
+			// Never empty the pool: if no candidate is large enough, keep the
+			// sorted full list so the session can still move forward.
+			list = largeEnough.length > 0 ? largeEnough : list;
+			// Explicit fallbackChain keeps its order (user's priority wins); only
+			// registry-derived candidates are sorted by descending window.
+			const pinned = new Set((config.fallbackChain ?? []).map((raw) => {
+				const cut = raw.indexOf("/");
+				return cut > 0 ? routeKey(raw.slice(0, cut), raw.slice(cut + 1)) : null;
+			}).filter(Boolean));
+			const sortable = list.filter((c) => !pinned.has(routeKey(c.provider, c.model)));
+			const fixed = list.filter((c) => pinned.has(routeKey(c.provider, c.model)));
+			sortable.sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
+			list = [...fixed, ...sortable];
 		}
 		return list;
+	}
+
+	/** Look up a model's context window from the live registry (best effort). */
+	async function currentModelWindow(provider, model) {
+		if (!provider || !model) return undefined;
+		try {
+			const models = await ctx.llm.listModels(provider);
+			return models.find((m) => m.id === model)?.contextWindow;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** One tiny real request to verify a candidate actually works right now. */
@@ -306,7 +349,8 @@ export async function apply(ctx, rawConfig) {
 		// Remember the failing route before anything else, so it is not picked as its own fallback.
 		markRoute(failedProvider, failedModel, code, failure.providerRetryAfterMs);
 
-		const pool = (await listCandidates(failedProvider, failedModel, code)).filter((candidate) => !isCooling(candidate.provider, candidate.model));
+		const currentWindow = await currentModelWindow(failedProvider, failedModel);
+		const pool = (await listCandidates(failedProvider, failedModel, code, currentWindow)).filter((candidate) => !isCooling(candidate.provider, candidate.model));
 		let chosen;
 		let probed = 0;
 		for (const candidate of pool) {
@@ -382,7 +426,8 @@ export async function apply(ctx, rawConfig) {
 		const current = agent.model.current();
 		// Idle resume probes ignore cooldowns: it is a low-frequency retry window,
 		// and cooldown-blocked candidates would leave the session stranded forever.
-		const pool = await listCandidates(current?.provider, current?.model, pending.code);
+		const currentWindow = await currentModelWindow(current?.provider, current?.model);
+		const pool = await listCandidates(current?.provider, current?.model, pending.code, currentWindow);
 		for (const candidate of pool) {
 			if (lifetime.signal.aborted) return;
 			const verdict = await probeRoute(candidate, undefined);
@@ -399,12 +444,20 @@ export async function apply(ctx, rawConfig) {
 				ctx.logger.info(`auto-continue: idle resume switched to "${candidate.provider}/${candidate.model}" (was ${pending.code})`);
 				return;
 			}
-			markRoute(candidate.provider, candidate.model, verdict.code, verdict.providerRetryAfterMs);
-			ctx.logger.warn(`auto-continue: idle-resume probe "${routeKey(candidate.provider, candidate.model)}" failed (${verdict.code})`);
+			// MODEL_SWITCH_COMPACTION_FAILED is a destination-window problem, not
+			// a broken route: do not blacklist the model for the long fault window.
+			if (verdict.code !== "MODEL_SWITCH_COMPACTION_FAILED") {
+				markRoute(candidate.provider, candidate.model, verdict.code, verdict.providerRetryAfterMs);
+			}
+			ctx.logger.warn(`auto-continue: idle-resume probe "${routeKey(candidate.provider, candidate.model)}" failed (${verdict.code}); trying next candidate`);
 		}
-		ctx.logger.warn(`auto-continue: idle resume found no healthy model (${pending.code}); will retry on the next idle`);
-		const prior = pendingResume.get(agent.id);
-		pendingResume.set(agent.id, { ...pending, attempts: (prior?.attempts ?? 0) + 1 });
+		// No healthy destination right now. Still queue ONE continuation so the
+		// loop retries on the current model (which may have recovered by then)
+		// instead of freezing the session. maxIdleResumes bounds this loop.
+		const used = idleResumes.get(agent.id) ?? 0;
+		idleResumes.set(agent.id, used + 1);
+		agent.followup(anyUserMessage(config.continuationText));
+		ctx.logger.warn(`auto-continue: idle resume found no healthy model (${pending.code}); queued continuation on current model (attempt ${used + 1}/${config.maxIdleResumes})`);
 	}
 
 	const disposeRequestError = ctx.on("agent/request-error", (payload, next) => recover(payload, next));
@@ -414,16 +467,29 @@ export async function apply(ctx, rawConfig) {
 		if (agentId) pendingResume.delete(agentId);
 		return typeof next === "function" ? next() : undefined;
 	});
+	const GLOBAL = { global: true };
 	// Driver-level failures (tool explosions, loop crashes) also deserve a resume.
+	// IMPORTANT: keep the real failure code when the error is an LLM-side fault
+	// (rate limit, quota, auth, ...). The request-error waterfall already records
+	// such failures; agent/error is the turn-end echo of the same error. Labelling
+	// it DRIVER_ERROR would make idle-resume only re-send "继续" on the SAME dead
+	// model, spinning for several turns instead of probing and switching.
 	const disposeAgentError = ctx.on("agent/error", (payload, next) => {
 		const agent = payload?.agent;
 		const error = payload?.error;
 		if (!agent || config.resumeOnErrorIdle === false) return typeof next === "function" ? next() : undefined;
 		if (/abort/i.test(String(error?.name ?? ""))) return typeof next === "function" ? next() : undefined;
+		const code = typeof error?.code === "string" && error.code.length > 0
+			? error.code
+			: (typeof error?.failure?.code === "string" ? error.failure.code : "DRIVER_ERROR");
 		const prior = pendingResume.get(agent.id);
-		pendingResume.set(agent.id, { code: "DRIVER_ERROR", message: String(error?.message ?? error).slice(0, 200), at: Date.now(), attempts: prior?.attempts ?? 0 });
+		// A switchable LLM fault must not override a pending record that already
+		// knows the failing route; first writer wins for this error tail.
+		if (!prior || prior.at < Date.now() - 30000) {
+			pendingResume.set(agent.id, { code, message: String(error?.message ?? error).slice(0, 200), at: Date.now(), attempts: prior?.attempts ?? 0 });
+		}
 		return typeof next === "function" ? next() : undefined;
-	});
+	}, GLOBAL);
 	// When the agent goes idle with an unresolved error tail, resume it once.
 	const disposeStatus = ctx.on("agent/status", (payload, next) => {
 		const agent = payload?.agent;
@@ -441,12 +507,12 @@ export async function apply(ctx, rawConfig) {
 			ctx.logger.warn(`auto-continue: idle resume failed: ${error instanceof Error ? error.message : String(error)}`);
 		});
 		return typeof next === "function" ? next() : undefined;
-	});
+	}, GLOBAL);
 	const disposeDisposed = ctx.on("agent/disposed", ({ agent }) => {
 		switches.delete(agent.id);
 		pendingResume.delete(agent.id);
 		idleResumes.delete(agent.id);
-	});
+	}, GLOBAL);
 	ctx.effect(() => async () => {
 		disposeRequestError();
 		disposeTurnStopping();

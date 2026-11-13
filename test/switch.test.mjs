@@ -3,11 +3,11 @@
  * Mocks the llm registry + agent surface, drives the real plugin code
  * through a request-error, and asserts the full switch chain.
  */
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import path from "node:path";
 import assert from "node:assert";
 
-const BUNDLE = "C:/Users/23529/Documents/deepseek-harness/default-workspace/dsh-auto-continue";
+const BUNDLE = fileURLToPath(new URL("..", import.meta.url));
 
 /** Build a fake provider catalog. raccoon-vision is storming (429), others healthy. */
 function makeLlm({ stormRaccoon = true } = {}) {
@@ -296,6 +296,57 @@ async function run() {
 		assert.strictEqual(record.selects.length, 0, "driver error does not switch models");
 		assert.strictEqual(record.followups[0].content[0].text.includes("继续"), true, "continuation text present");
 		console.log("SCENARIO 7 PASS — driver error resumed without switching");
+	}
+
+	// ---- Scenario 8: agent/error echo of an LLM fault keeps the real code, so
+	//      idle-resume probes+switches instead of spinning on the dead model.
+	//      Regression for 2026-11-13: RATE_LIMIT was mislabelled DRIVER_ERROR.
+	{
+		const llm = makeLlm({ stormRaccoon: false });
+		const listeners = {};
+		const ctx = {
+			llm,
+			logger: { info() {}, warn() {}, error() {} },
+			on(name, listener) { listeners[name] = listener; return () => {}; },
+			effect() {}
+		};
+		await mod.apply(ctx, {});
+		const { agent, record } = makeAgent();
+		const err = Object.assign(new Error("raccoon 429"), { code: "RATE_LIMIT" });
+		await listeners["agent/error"]({ agent, turn: 11, step: 1, error: err });
+		await listeners["agent/status"]({ agent, status: "idle" });
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.strictEqual(record.followups.length, 1, "LLM fault still resumes");
+		assert.strictEqual(record.selects.length, 1, "LLM fault SWITCHES instead of spinning on the dead model");
+		assert.notStrictEqual(record.selects[0].provider, "raccoon-vision", "left the rate-limited provider");
+		console.log("SCENARIO 8 PASS — LLM fault code preserved; idle resume switched to", record.selects[0].provider);
+	}
+
+	// ---- Scenario 9: preferLargeContext picks a destination with a window >=
+	//      the current one, so a switch never triggers compaction (whose summary
+	//      uses the failing previous model).
+	{
+		const llm = makeLlm({ stormRaccoon: false });
+		llm.listModels = async (provider) => {
+			const windows = { "raccoon-vision": 192000, "trae-vision": 1000000, loomy: 128000 };
+			return (windows[provider] ? [{ id: provider === "raccoon-vision" ? "sn-glm-5-3" : (provider === "trae-vision" ? "glm-5.3" : "GLM-5.3-Flash"), name: provider, contextWindow: windows[provider] }] : []);
+		};
+		const listeners = {};
+		const ctx = {
+			llm,
+			logger: { info() {}, warn() {}, error() {} },
+			on(name, listener) { listeners[name] = listener; return () => {}; },
+			effect() {}
+		};
+		await mod.apply(ctx, { preferLargeContext: true });
+		const { agent, record } = makeAgent();
+		await listeners["agent/request-error"](
+			{ agent, turn: 3, step: 1, provider: "raccoon-vision", failure: { code: "QUOTA", message: "quota" }, signal: new AbortController().signal },
+			async () => undefined
+		);
+		assert.strictEqual(record.selects.length, 1, "switched once");
+		assert.strictEqual(record.selects[0].provider, "trae-vision", "chose the only candidate whose window >= current (192000): " + JSON.stringify(record.selects[0]));
+		console.log("SCENARIO 9 PASS — large-window candidate preferred");
 	}
 
 	console.log("\nALL SCENARIOS PASS");
