@@ -266,22 +266,20 @@ export async function apply(ctx, rawConfig) {
 		return entry !== undefined && entry.until > now;
 	}
 
+	/**
+	 * Model ids that are never a chat target: provider account slots are exposed
+	 * as bare numeric ids (`doubao/0`, `doubao/9`), and image engines cannot
+	 * answer a text turn. Probing them just burns turns.
+	 */
+	const NON_CHAT_MODEL = /^(?:\d+|.*image-gen.*|.*-image|.*_image)$/i;
+
 	/** Enumerate fallback candidates: explicit chain first, then the full registry. */
 	async function listCandidates(excludeProvider, excludeModel, failureCode, currentWindow) {
-		const ordered = [];
-		const seen = new Set();
-		const push = (provider, model, contextWindow) => {
-			const key = routeKey(provider, model);
-			if (seen.has(key)) return;
-			seen.add(key);
-			ordered.push({ provider, model, contextWindow });
-		};
-		for (const raw of config.fallbackChain ?? []) {
-			const cut = raw.indexOf("/");
-			const model = cut > 0 ? raw.slice(cut + 1) : "";
-			if (cut <= 0 || model === "") continue; // skip "garbage", "/leading", "trailing/"
-			push(raw.slice(0, cut), model);
-		}
+		// Collect the live registry FIRST: an explicit chain entry needs its real
+		// context window, and a chain entry must never be dropped merely because
+		// its window is unknown.
+		const registry = [];
+		const windowOf = new Map();
 		try {
 			for (const provider of ctx.llm.listProviders()) {
 				let models = [];
@@ -290,15 +288,51 @@ export async function apply(ctx, rawConfig) {
 				} catch {
 					continue;
 				}
-				for (const model of models) push(provider.id, model.id, model.contextWindow);
+				for (const model of models) {
+					windowOf.set(routeKey(provider.id, model.id), model.contextWindow);
+					registry.push({ provider: provider.id, model: model.id, contextWindow: model.contextWindow });
+				}
 			}
 		} catch {
 			// registry unavailable; the explicit chain still applies
 		}
+
+		const ordered = [];
+		const seen = new Set();
+		const push = (provider, model, contextWindow) => {
+			const key = routeKey(provider, model);
+			if (seen.has(key)) return;
+			seen.add(key);
+			ordered.push({ provider, model, contextWindow });
+		};
+
+		const chainRoutes = [];
+		for (const raw of config.fallbackChain ?? []) {
+			const cut = raw.indexOf("/");
+			const model = cut > 0 ? raw.slice(cut + 1) : "";
+			if (cut <= 0 || model === "") continue; // skip "garbage", "/leading", "trailing/"
+			const provider = raw.slice(0, cut);
+			chainRoutes.push({ provider, model, contextWindow: windowOf.get(routeKey(provider, model)) });
+		}
+		for (const candidate of chainRoutes) push(candidate.provider, candidate.model, candidate.contextWindow);
+
+		// An explicit chain is AUTHORITATIVE: the user chose both the members and
+		// their order, so the registry is consulted only when the chain itself has
+		// no usable route left (never as a silent extra source of candidates).
+		const chainConfigured = chainRoutes.length > 0;
+		const pushRegistry = () => {
+			for (const candidate of registry) {
+				if (NON_CHAT_MODEL.test(String(candidate.model))) continue;
+				push(candidate.provider, candidate.model, candidate.contextWindow);
+			}
+		};
+		if (!chainConfigured) pushRegistry();
+
 		let list = ordered.filter((candidate) => !(candidate.provider === excludeProvider && candidate.model === excludeModel));
 		const minWindow = Math.max(0, Number(config.minContextWindow) || 0);
 		if (minWindow > 0) {
-			list = list.filter((candidate) => (candidate.contextWindow ?? 0) >= minWindow);
+			// An unknown window must not disqualify a configured chain entry.
+			list = list.filter((candidate) => candidate.contextWindow === undefined || (candidate.contextWindow ?? 0) >= minWindow);
 		}
 		// A model switch may trigger context compaction, whose summary uses the
 		// PREVIOUS routed model. If the previous model is the one that is failing,
@@ -309,20 +343,25 @@ export async function apply(ctx, rawConfig) {
 		if (wantLarge && Number.isFinite(currentWindow) && currentWindow > 0) {
 			// Destinations smaller than the current window force compaction, whose
 			// summary uses the failing previous model — a guaranteed dead end.
-			const largeEnough = list.filter((c) => (c.contextWindow ?? 0) >= currentWindow);
+			// Treat an UNKNOWN window as acceptable: dropping it would discard the
+			// user's configured chain whenever the registry could not be read.
+			const largeEnough = list.filter((c) => c.contextWindow === undefined || (c.contextWindow ?? 0) >= currentWindow);
 			// Never empty the pool: if no candidate is large enough, keep the
 			// sorted full list so the session can still move forward.
 			list = largeEnough.length > 0 ? largeEnough : list;
 			// Explicit fallbackChain keeps its order (user's priority wins); only
 			// registry-derived candidates are sorted by descending window.
-			const pinned = new Set((config.fallbackChain ?? []).map((raw) => {
-				const cut = raw.indexOf("/");
-				return cut > 0 ? routeKey(raw.slice(0, cut), raw.slice(cut + 1)) : null;
-			}).filter(Boolean));
+			const pinned = new Set(chainRoutes.map((raw) => routeKey(raw.provider, raw.model)));
 			const sortable = list.filter((c) => !pinned.has(routeKey(c.provider, c.model)));
 			const fixed = list.filter((c) => pinned.has(routeKey(c.provider, c.model)));
 			sortable.sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
 			list = [...fixed, ...sortable];
+		}
+		// Last resort: a configured chain whose every entry is the current model or
+		// blocked would otherwise strand the session, so widen to the registry.
+		if (chainConfigured && list.length === 0) {
+			pushRegistry();
+			list = ordered.filter((candidate) => !(candidate.provider === excludeProvider && candidate.model === excludeModel));
 		}
 		return list;
 	}

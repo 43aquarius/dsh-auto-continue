@@ -186,6 +186,136 @@ async function run() {
 		await cleanup();
 	});
 
+	// --- T6d: an explicit chain must win even when registry windows are larger
+	await test("T6d explicit chain wins over larger registry windows", async () => {
+		// The bug: chain entries entered the pool without a contextWindow, the
+		// preferLargeContext filter scored them as 0 and dropped every one, and
+		// the pool then held only registry candidates sorted by window size — the
+		// session walked a foreign provider's list instead of the configured chain.
+		// The registry here carries a BIGGER, non-junk chat model on purpose, so a
+		// regression that lets the registry back into a configured chain fails.
+		const catalog = {
+			"trae-vision": [{ id: "glm-5.3", contextWindow: 1000000 }],
+			doubao: [
+				{ id: "0", contextWindow: 4000000 },
+				{ id: "seed-lite-7b", contextWindow: 4000000 }
+			],
+			loomy: [
+				{ id: "GLM-5.3-Flash", contextWindow: 128000 },
+				{ id: "deepseek-v4-flash-1017", contextWindow: 128000 }
+			]
+		};
+		const probeLog = [];
+		const llm = {
+			listProviders: () => Object.keys(catalog).map((id) => ({ id, name: id })),
+			async listModels(provider) { return catalog[provider] ?? []; },
+			async *stream(options) {
+				probeLog.push(`${options.provider}/${options.model}`);
+				yield { type: "finish", reason: { kind: "stop" } };
+			}
+		};
+		const made = makeAgent();
+		// Current model has a SMALLER window than the foreign candidates — the
+		// exact condition that triggered the reported walk down doubao's list.
+		made.agent.model = {
+			current: () => ({ provider: "trae-vision", model: "glm-5.3" }),
+			select: (s) => made.record.selects.push(s)
+		};
+		const chain = ["loomy/GLM-5.3-Flash", "loomy/deepseek-v4-flash-1017"];
+		const { call, cleanup } = await mount(mod, {
+			fallbackChain: chain,
+			preferLargeContext: true
+		}, llm);
+		await call("agent/request-error", basePayload({
+			agent: made.agent,
+			provider: "trae-vision",
+			model: "glm-5.3",
+			failure: { code: "RATE_LIMIT", message: "429" }
+		}), () => "OK");
+		assert.strictEqual(probeLog.length > 0, true, "something must be probed");
+		assert.strictEqual(probeLog[0], "loomy/GLM-5.3-Flash", "the chain's first entry must be probed first");
+		assert.ok(!probeLog.some((r) => r.startsWith("doubao/")), "a configured chain must never fall into another provider: " + JSON.stringify(probeLog));
+		assert.strictEqual(made.record.selects.length, 1);
+		assert.deepStrictEqual(made.record.selects[0], { provider: "loomy", model: "GLM-5.3-Flash" });
+		await cleanup();
+	});
+
+	// --- T6e: with no chain, registry enumeration skips account slots/image engines
+	await test("T6e registry fallback never targets account slots or image engines", async () => {
+		const catalog = {
+			doubao: [
+				{ id: "0", contextWindow: 4000000 },
+				{ id: "image-gen", contextWindow: 4000000 },
+				{ id: "seed-lite-7b", contextWindow: 4000000 }
+			]
+		};
+		const probeLog = [];
+		const llm = {
+			listProviders: () => Object.keys(catalog).map((id) => ({ id, name: id })),
+			async listModels(provider) { return catalog[provider] ?? []; },
+			async *stream(options) {
+				probeLog.push(`${options.provider}/${options.model}`);
+				yield { type: "finish", reason: { kind: "stop" } };
+			}
+		};
+		const made = makeAgent();
+		made.agent.model = {
+			current: () => ({ provider: "trae-vision", model: "glm-5.3" }),
+			select: (s) => made.record.selects.push(s)
+		};
+		const { call, cleanup } = await mount(mod, { fallbackChain: [], preferLargeContext: true }, llm);
+		await call("agent/request-error", basePayload({
+			agent: made.agent,
+			provider: "trae-vision",
+			model: "glm-5.3",
+			failure: { code: "RATE_LIMIT", message: "429" }
+		}), () => "OK");
+		assert.ok(!probeLog.includes("doubao/0"), "must never probe the doubao/0 account slot");
+		assert.ok(!probeLog.includes("doubao/image-gen"), "must never probe an image engine for a text turn");
+		assert.deepStrictEqual(probeLog, ["doubao/seed-lite-7b"], "only real chat models remain");
+		await cleanup();
+	});
+
+	// --- T6f: a chain entry whose provider is temporarily unregistered survives
+	await test("T6f chain entry with an unknown window is still usable", async () => {
+		// A provider that is still registering reports no model list, so the chain
+		// route has no known context window. minContextWindow / preferLargeContext
+		// must not treat "unknown" as "too small" and silently drop the user's
+		// configured chain entry.
+		const catalog = {
+			"trae-vision": [{ id: "glm-5.3", contextWindow: 1000000 }]
+		};
+		const probeLog = [];
+		const llm = {
+			listProviders: () => Object.keys(catalog).map((id) => ({ id, name: id })),
+			async listModels(provider) { return catalog[provider] ?? []; },
+			async *stream(options) {
+				probeLog.push(`${options.provider}/${options.model}`);
+				yield { type: "finish", reason: { kind: "stop" } };
+			}
+		};
+		const made = makeAgent();
+		made.agent.model = {
+			current: () => ({ provider: "trae-vision", model: "glm-5.3" }),
+			select: (s) => made.record.selects.push(s)
+		};
+		const { call, cleanup } = await mount(mod, {
+			fallbackChain: ["late-provider/not-yet-listed"],
+			preferLargeContext: true,
+			minContextWindow: 200000
+		}, llm);
+		await call("agent/request-error", basePayload({
+			agent: made.agent,
+			provider: "trae-vision",
+			model: "glm-5.3",
+			failure: { code: "RATE_LIMIT", message: "429" }
+		}), () => "OK");
+		assert.strictEqual(probeLog[0], "late-provider/not-yet-listed",
+			"an unknown-window chain entry must still be tried first, got " + JSON.stringify(probeLog));
+		assert.deepStrictEqual(made.record.selects[0], { provider: "late-provider", model: "not-yet-listed" });
+		await cleanup();
+	});
+
 	// --- T7: all probes fail -> no switch, error surfaced, pending resume recorded
 	await test("T7 total probe failure surfaces error and arms idle resume", async () => {
 		const { call, cleanup } = await mount(mod, {}, makeLlm({ stormAll: true }));
