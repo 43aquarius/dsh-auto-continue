@@ -223,6 +223,24 @@ async function run() {
 		assert.strictEqual(save.json.code, "settings-unavailable");
 	});
 
+	await test("B9 every Config field is volatile (settings.mutate refuses otherwise)", async () => {
+		// The Host rejects mutate with "Plugin entry ... has no volatile fields"
+		// unless the schema marks fields volatile. Assert it on the real schema.
+		assert.ok(mod.Config, "Config schema must be built (schemastery reachable)");
+		const keys = Object.keys(mod.Config.dict ?? {});
+		assert.ok(keys.length >= 20, `expected the full field set, got ${keys.length}`);
+		const notVolatile = [];
+		for (const key of keys) {
+			const node = mod.Config.dict[key];
+			// schemastery keeps the flag on the node; treat a missing accessor as unknown.
+			const flag = typeof node.meta?.volatile === "boolean" ? node.meta.volatile
+				: typeof node.volatile === "boolean" ? node.volatile
+					: undefined;
+			if (flag !== true) notVolatile.push(key);
+		}
+		assert.deepStrictEqual(notVolatile, [], "these fields would block saving: " + notVolatile.join(", "));
+	});
+
 	console.log(`\nBRIDGE SUITE: ${passed} passed, ${failed} failed`);
 	if (failed > 0) process.exitCode = 1;
 }

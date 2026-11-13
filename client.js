@@ -1,18 +1,20 @@
 /**
  * @local/auto-continue — browser half: the bundle's settings panel.
  *
- * Design (v1.5.0):
+ * Design (v1.6.0):
  *   - EVERY setting is a choice. There is no free-text input anywhere: the
- *     model chain is a checkbox list built from the LIVE provider catalog, and
- *     the remaining fields are curated <select>s.
+ *     model chain is a grouped checkbox list over the LIVE provider catalog,
+ *     and the remaining fields are curated <select>s.
+ *   - The catalog is NEVER baked into this file. Provider ids change between
+ *     deployments (see `workbuddy`, `trae`, `raccoon`, `loomy`, `our-free-model`
+ *     in this profile), so a hardcoded list is wrong the moment a plugin is
+ *     renamed. The Host enumerates `llm.listProviders()/listModels()` per
+ *     request; this half unions the answers over a short poll window, because
+ *     providers register asynchronously and a single early fetch misses them.
  *   - Persistence goes through the plugin's OWN Host bridge
- *     (`/api/dsh-auto-continue-settings`) instead of a framework config form.
- *     This profile does not mount the shipped config-form subsystem, so the
- *     plugin manager never hands this cell a `form`; the working plugins in
- *     this ecosystem own their settings surface the same way. Saving is a
- *     single POST that the Host applies with `settings.mutate`.
- *   - Only baseline services are injected (`slots`, `locale`). Anything else
- *     would leave the plugin pending forever and no slot would register.
+ *     (`/api/dsh-auto-continue-settings/save` -> `settings.mutate`). The Host
+ *     Config fields are `.volatile()`, which `settings.mutate` requires.
+ *   - Only baseline services are injected (`slots`, `locale`).
  */
 window.__ModuleLoader__.load({
 	id: "@local/auto-continue",
@@ -24,52 +26,8 @@ window.__ModuleLoader__.load({
 		const opt = (label, value, recommended) => ({ label, value, ...(recommended ? { recommended: true } : {}) });
 
 		const BRIDGE = "/api/dsh-auto-continue-settings";
-
-		/**
-		 * Fallback catalog, used only until the Host answers with the live list.
-		 * The Host bridge enumerates llm.listProviders()/listModels() at request
-		 * time, so the real picker is always the current deployment's catalog.
-		 */
-		const FREE_MODELS = [
-			"big-pickle", "mimo-v2.6-flash-free", "deepseek-v4.1-flash-free",
-			"glm-5.3-flash-free", "longcat-2.5-free", "iceman-free",
-			"inkling-2-small-free", "beam-free", "flint-40b-free",
-			"nemotron-3.5-super-vl-free", "nemotron-3.5-lightning-free",
-			"minimax-m3.1-flash-free", "opencode/nemotron-3.5-lightning-free",
-			"opencode/flint-40b-free", "minimaxai/minimax-m3.1-flash",
-			"openai/gpt-oss-20b", "z-ai/glm-5.3-flash", "stepfun-ai/step-5-preview",
-			"deepseek-ai/deepseek-v4.1-flash", "opencode/glm-5.3-flash-free",
-			"moonshotai/kimi-k2.6", "opencode/nemotron-3.5-super-vl-free",
-			"opencode/deepseek-v4.1-flash-free", "kilo-auto/free",
-			"nvidia/nemotron-3.5-super-vl:free", "stealth/glyph-cluster",
-			"baidu/ernie-5.5-flash-preview:free", "liquid/lfm-3-1.7b:free",
-			"particle-ai/particle-1:free", "dots-studio/dots-3-note-preview:free",
-			"nvidia/nemotron-3.5-lightning:free", "cohere/north-mini-code:free",
-			"nvidia/nemotron-3-ultra-550b-a55b:free",
-			"nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-			"openrouter/free", "reflection/beam-free", "agnes/agnes-2.0-flash",
-			"combo:recommended-free"
-		];
-		const KNOWN_MODELS = {
-			"workbuddy-vision": ["hy4free", "hy4std", "hy3", "hy3-x", "glm-5.3", "glm-5.3-flash", "glm-5.2", "deepseek-v4.1-flash", "deepseek-v4-pro", "minimax-m3.1-flash", "kimi-k3.1-pro", "kimi-k3-1", "kimi-k2.8-preview", "step-5-preview", "mimo-v2.6-pro", "space-bunny"],
-			raccoon: ["sn-deepseek-v4-1-flash-1017"],
-			"trae-vision": ["glm-5.3", "deepseek-v4.1-flash"],
-			"vision-http": ["ovh/Qwen3.5-397B-A17B"],
-			"our-free-model": FREE_MODELS,
-			"our-free-model-vision": FREE_MODELS,
-			"kilo-auto": ["free"],
-			"deepseek-account": ["deepseek-v4-pro"]
-		};
-		const bakedRoutes = () => {
-			const all = [];
-			for (const [provider, models] of Object.entries(KNOWN_MODELS)) {
-				for (const model of models) {
-					const route = `${provider}/${model}`;
-					if (!all.includes(route)) all.push(route);
-				}
-			}
-			return all;
-		};
+		/** Providers register lazily; sample a few times and union the answers. */
+		const POLL_DELAYS_MS = [0, 700, 1600, 3200, 6000];
 
 		/**
 		 * Field schema. `options[].value` is the REAL config value; the <select>
@@ -172,10 +130,18 @@ window.__ModuleLoader__.load({
 
 		const recommendedOf = (f) => (f.options.find((o) => o.recommended) ?? f.options[0]).value;
 		const indexOfValue = (f, v) => f.options.findIndex((o) => eq(o.value, v));
+		const providerOf = (route) => {
+			const at = String(route).indexOf("/");
+			return at < 0 ? "(unknown)" : String(route).slice(0, at);
+		};
 
 		const selectStyle = { width: "100%", boxSizing: "border-box", fontSize: 13, padding: "4px 6px" };
 		const labelStyle = { flex: "0 0 210px", fontSize: 13, lineHeight: "26px", opacity: 0.9 };
 		const rowStyle = { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 10 };
+		const boxStyle = {
+			border: "1px solid var(--dsw-alias-border-secondary, #d0d0d0)",
+			borderRadius: 6, padding: 8
+		};
 
 		function SelectField({ field, value, onChange, disabled }) {
 			const found = indexOfValue(field, value);
@@ -191,10 +157,43 @@ window.__ModuleLoader__.load({
 			}, field.options.map((o, i) => h("option", { key: i, value: String(i) }, o.label + (o.recommended ? " ★推荐" : ""))));
 		}
 
-		/** Ordered checkbox list over the LIVE model catalog. No text input. */
-		function ChainField({ value, models, onChange, disabled }) {
+		/**
+		 * Ordered checkbox list over the LIVE catalog, grouped by provider.
+		 * A provider <select> narrows the list; "全部" shows everything. No text
+		 * entry anywhere, so nothing needs typing to reach all 159+ routes.
+		 */
+		function ChainField({ value, models, onChange, disabled, onRefresh, refreshing }) {
 			const chain = Array.isArray(value) ? value.filter((x) => typeof x === "string") : [];
-			const catalog = models.length ? models : bakedRoutes();
+			// Accept either plain route strings or `{route}` records; the Host sends
+			// records, tests and older payloads may send strings.
+			const catalogModels = React.useMemo(() => {
+				const list = (Array.isArray(models) ? models : [])
+					.map((m) => (typeof m === "string" ? m : m && typeof m.route === "string" ? m.route : undefined))
+					.filter((m) => typeof m === "string" && m !== "");
+				return Array.from(new Set(list)).sort();
+			}, [models]);
+			const [providerFilter, setProviderFilter] = React.useState("__all__");
+
+			const providers = React.useMemo(() => {
+				const set = new Set(catalogModels.map(providerOf));
+				return Array.from(set).sort();
+			}, [catalogModels]);
+
+			const visible = providerFilter === "__all__"
+				? catalogModels
+				: catalogModels.filter((route) => providerOf(route) === providerFilter);
+
+			// Group by provider for display, preserving catalog order within a group.
+			const grouped = React.useMemo(() => {
+				const map = new Map();
+				for (const route of visible) {
+					const provider = providerOf(route);
+					if (!map.has(provider)) map.set(provider, []);
+					map.get(provider).push(route);
+				}
+				return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+			}, [visible]);
+
 			const toggle = (route) => {
 				const next = chain.includes(route) ? chain.filter((x) => x !== route) : [...chain, route];
 				onChange("fallbackChain", next);
@@ -209,11 +208,14 @@ window.__ModuleLoader__.load({
 				next.splice(to, 0, item);
 				onChange("fallbackChain", next);
 			};
+
+			const filterIdx = providerFilter === "__all__" ? 0 : providers.indexOf(providerFilter) + 1;
+
 			return h("div", null,
 				h("div", { style: { fontSize: 12, opacity: 0.75, marginBottom: 6 } },
 					chain.length === 0
-						? "未勾选任何模型 → 自动枚举全部可用模型（按窗口大小与健康状态择优）"
-						: `已选 ${chain.length} 个，按顺序优先尝试：`),
+						? `未勾选任何模型 → 自动枚举全部可用模型（当前目录 ${models.length} 个）`
+						: `已选 ${chain.length} 个，按顺序优先尝试（当前目录 ${models.length} 个）：`),
 				chain.length === 0 ? null : h("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 } },
 					chain.map((route, i) => h("span", {
 						key: route,
@@ -229,29 +231,50 @@ window.__ModuleLoader__.load({
 						h("button", { type: "button", disabled, title: "移除", onClick: () => toggle(route), style: { cursor: "pointer", border: "none", background: "transparent" } }, "×")
 					))
 				),
-				h("div", {
-					style: {
-						maxHeight: 240, overflowY: "auto", border: "1px solid var(--dsw-alias-border-secondary, #d0d0d0)",
-						borderRadius: 6, padding: 8
-					}
-				},
-					catalog.map((route) => h("label", {
-						key: route,
-						style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, lineHeight: "20px", cursor: "pointer" }
+				h("div", { style: { display: "flex", gap: 6, marginBottom: 6 } },
+					h("select", {
+						value: String(filterIdx), disabled, style: { ...selectStyle, flex: 1 },
+						onChange: (e) => {
+							const i = Number(e.target.value);
+							setProviderFilter(i === 0 ? "__all__" : (providers[i - 1] ?? "__all__"));
+						}
 					},
-						h("input", {
-							type: "checkbox",
-							checked: chain.includes(route),
-							disabled,
-							onChange: () => toggle(route)
-						}),
-						h("span", null, route)
-					))
+						[
+							h("option", { key: "__all__", value: "0" }, `全部厂商（${models.length} 个模型）`),
+							...providers.map((p, i) => {
+								const count = models.filter((r) => providerOf(r) === p).length;
+								return h("option", { key: p, value: String(i + 1) }, `${p}（${count}）`);
+							})
+						]
+					),
+					h("button", {
+						type: "button", disabled: disabled || refreshing, onClick: onRefresh,
+						style: { fontSize: 12, padding: "3px 10px", cursor: disabled || refreshing ? "default" : "pointer", whiteSpace: "nowrap" }
+					}, refreshing ? "读取中…" : "刷新模型列表")
+				),
+				h("div", { style: { ...boxStyle, maxHeight: 300, overflowY: "auto" } },
+					models.length === 0
+						? h("div", { style: { fontSize: 12, opacity: 0.7 } }, "Host 未返回任何模型；请点「刷新模型列表」或重启 DSH。")
+						: grouped.map(([provider, routes]) => h("div", { key: provider, style: { marginBottom: 6 } },
+							h("div", { style: { fontSize: 12, fontWeight: 600, opacity: 0.85, margin: "2px 0 2px" } }, `${provider}（${routes.length}）`),
+							routes.map((route) => h("label", {
+								key: route,
+								style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, lineHeight: "20px", cursor: "pointer", paddingLeft: 8 }
+							},
+								h("input", {
+									type: "checkbox",
+									checked: chain.includes(route),
+									disabled,
+									onChange: () => toggle(route)
+								}),
+								h("span", null, route.slice(provider.length + 1))
+							))
+						))
 				)
 			);
 		}
 
-		function Panel({ initial, models, writable }) {
+		function Panel({ initial, models, writable, onRefresh, refreshing }) {
 			const [draft, setDraft] = React.useState(() => {
 				const seed = {};
 				for (const field of FIELDS) {
@@ -296,7 +319,7 @@ window.__ModuleLoader__.load({
 						setError(`保存失败：${body?.message ?? body?.code ?? `HTTP ${res.status}`}`);
 						return;
 					}
-					setNotice("已保存（下次加载配置时生效）");
+					setNotice("已保存并即时生效");
 				} catch (e) {
 					setError(`保存请求失败：${e && e.message ? e.message : String(e)}`);
 				} finally {
@@ -317,7 +340,9 @@ window.__ModuleLoader__.load({
 									value: draft[field.key],
 									models,
 									disabled: busy || !writable,
-									onChange: setField
+									onChange: setField,
+									onRefresh,
+									refreshing
 								})
 								: h(SelectField, {
 									field,
@@ -335,7 +360,7 @@ window.__ModuleLoader__.load({
 				!writable ? h("p", { style: { color: "#c33", margin: "0 0 8px" } },
 					"配置暂时只读：Host 配置服务不可用，重启 DSH 后再试。") : null,
 				sections,
-				h("div", { style: { display: "flex", alignItems: "center", gap: 12, marginTop: 6 } },
+				h("div", { style: { display: "flex", alignItems: "center", gap: 12, marginTop: 6, flexWrap: "wrap" } },
 					h("button", {
 						type: "button",
 						disabled: busy || !writable || !dirty,
@@ -350,48 +375,93 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** Loads the Host state, then renders the panel (or a readable failure). */
+		/**
+		 * Loads Host state, keeps sampling the catalog until it stops growing,
+		 * and exposes an explicit refresh. Providers mount asynchronously, so a
+		 * single early fetch reports a partial list — the exact "list is
+		 * incomplete" symptom this replaces.
+		 */
 		function AutoContinueSettings() {
-			const [state, setState] = React.useState({ phase: "loading" });
+			const [state, setState] = React.useState({ phase: "loading", models: [] });
+			const [refreshing, setRefreshing] = React.useState(false);
+			const modelsRef = React.useRef([]);
+			const timersRef = React.useRef([]);
+
+			const sample = React.useCallback(async ({ keepModels } = {}) => {
+				const res = await fetch(`${BRIDGE}/state`, { method: "GET" });
+				const body = await res.json().catch(() => ({}));
+				if (!res.ok || body?.ok !== true) {
+					throw new Error(body?.message ?? `HTTP ${res.status}`);
+				}
+				const live = Array.isArray(body.models)
+					? body.models.map((m) => (typeof m === "string" ? m : m?.route)).filter((x) => typeof x === "string" && x !== "")
+					: [];
+				const union = keepModels
+					? Array.from(new Set([...modelsRef.current, ...live])).sort()
+					: live.slice().sort();
+				modelsRef.current = union;
+				return { config: body.config ?? {}, writable: body.writable !== false, models: union };
+			}, []);
+
+			const refresh = React.useCallback(async () => {
+				setRefreshing(true);
+				try {
+					const next = await sample({ keepModels: false });
+					setState({ phase: "ready", ...next });
+				} catch (e) {
+					setState((prev) => ({ ...prev, phase: prev.phase === "ready" ? "ready" : "failed", message: e && e.message ? e.message : String(e) }));
+				} finally {
+					setRefreshing(false);
+				}
+			}, [sample]);
+
 			React.useEffect(() => {
 				let cancelled = false;
-				(async () => {
+				let settled = false;
+				const tick = async () => {
 					try {
-						const res = await fetch(`${BRIDGE}/state`, { method: "GET" });
-						const body = await res.json().catch(() => ({}));
+						const next = await sample({ keepModels: true });
 						if (cancelled) return;
-						if (!res.ok || body?.ok !== true) {
-							setState({ phase: "failed", message: body?.message ?? `HTTP ${res.status}` });
-							return;
-						}
-						setState({
-							phase: "ready",
-							config: body.config ?? {},
-							writable: body.writable !== false,
-							models: Array.isArray(body.models)
-								? body.models.map((m) => (typeof m === "string" ? m : m?.route)).filter((x) => typeof x === "string" && x !== "")
-								: []
-						});
+						settled = true;
+						setState({ phase: "ready", ...next });
 					} catch (e) {
-						if (!cancelled) setState({ phase: "failed", message: e && e.message ? e.message : String(e) });
+						if (cancelled) return;
+						// Keep whatever we already showed; only fail on the first sample.
+						setState((prev) => (prev.phase === "ready"
+							? prev
+							: { phase: "failed", message: e && e.message ? e.message : String(e), models: [] }));
 					}
-				})();
-				return () => { cancelled = true; };
-			}, []);
+				};
+				// First sample gates the panel; later ones only widen the catalog.
+				void tick();
+				for (const delay of POLL_DELAYS_MS.slice(1)) {
+					timersRef.current.push(setTimeout(() => { if (!cancelled) void tick(); }, delay));
+				}
+				return () => {
+					cancelled = true;
+					for (const id of timersRef.current) clearTimeout(id);
+					timersRef.current = [];
+					void settled;
+				};
+			}, [sample]);
+
 			if (state.phase === "loading") {
 				return h("div", { "data-plugin-config": true, style: { fontSize: 13, opacity: 0.7 } }, "正在读取配置…");
 			}
 			if (state.phase === "failed") {
 				return h("div", { "data-plugin-config": true, style: { fontSize: 13 } },
 					h("p", { style: { color: "#c33", margin: "0 0 6px" } }, "无法读取配置"),
-					h("p", { style: { opacity: 0.75, margin: 0 } },
-						`${state.message ?? "未知错误"}。若刚安装或升级，请重启 DSH 后重开此页。`));
+					h("p", { style: { opacity: 0.75, margin: "0 0 8px" } },
+						`${state.message ?? "未知错误"}。若刚安装或升级，请重启 DSH 后重开此页。`),
+					h("button", { type: "button", onClick: refresh, style: { fontSize: 13, padding: "5px 14px" } }, "重试"));
 			}
 			return h(Panel, {
 				key: JSON.stringify(state.config),
 				initial: state.config,
 				models: state.models ?? [],
-				writable: state.writable
+				writable: state.writable,
+				onRefresh: refresh,
+				refreshing
 			});
 		}
 

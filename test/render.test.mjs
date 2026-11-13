@@ -41,7 +41,13 @@ const React = {
 	},
 	useEffect: () => { hookIndex++; },
 	useMemo: (fn) => { hookIndex++; return fn(); },
-	useCallback: (fn) => { hookIndex++; return fn; }
+	useCallback: (fn) => { hookIndex++; return fn; },
+	useRef: (init) => {
+		const slots = hookStore.get(currentComponent);
+		const i = hookIndex++;
+		if (slots[i] === undefined) slots[i] = { current: init };
+		return slots[i];
+	}
 };
 
 // ---- mock fetch (the bridge) --------------------------------------------
@@ -75,7 +81,9 @@ function fakeFetch(url, init) {
 let plugin = null;
 const sandbox = {
 	window: { __ModuleLoader__: { load: (def) => { plugin = def; } } },
-	React, console, fetch: fakeFetch
+	React, console, fetch: fakeFetch,
+	setTimeout: (fn) => { void fn; return 0; },
+	clearTimeout: () => {}
 };
 vm.runInNewContext(src, sandbox, { filename: "client.js" });
 if (!plugin) throw new Error("client.js did not register a module");
@@ -141,20 +149,30 @@ console.log("selects:", selects.length, "buttons:", buttons.length,
 if (textareas.length !== 0) throw new Error("panel must not contain a textarea (choices only)");
 if (textInputs.length !== 0) throw new Error("panel must not contain a text input (choices only)");
 
-// 2. One <select> per curated field (every field except the model chain).
-if (selects.length !== 19) throw new Error(`expected 19 selects (20 fields - 1 chain), got ${selects.length}`);
+// 2. One <select> per curated field (every field except the model chain), plus
+//    the chain's provider filter — so 20 selects and 19 of them are fields.
+const optionTexts = (sel) => (sel.children ?? []).filter((o) => o.type === "option").map((o) => textOf(o));
+const fieldSelects = selects.filter((sel) => optionTexts(sel).some((t) => t.includes("★推荐")));
+const filterSelects = selects.filter((sel) => optionTexts(sel).some((t) => t.startsWith("全部厂商")));
+console.log("fieldSelects:", fieldSelects.length, "filterSelects:", filterSelects.length);
+if (fieldSelects.length !== 19) throw new Error(`expected 19 field selects, got ${fieldSelects.length}`);
+if (filterSelects.length !== 1) throw new Error(`expected 1 provider filter select, got ${filterSelects.length}`);
+if (!optionTexts(filterSelects[0]).some((t) => t.includes(`（${MODELS.length} 个模型）`))) {
+	throw new Error("provider filter must report the live catalog size, got " + optionTexts(filterSelects[0]).join(" | "));
+}
 
-// 3. The model chain is a checkbox list over the LIVE catalog, nothing else.
+// 3. The model chain is a checkbox list over the LIVE catalog, grouped by
+//    provider, nothing else.
 if (checkboxes.length !== MODELS.length) {
 	throw new Error(`chain list must offer every live route: expected ${MODELS.length} checkboxes, got ${checkboxes.length}`);
 }
 if (!selects.length) throw new Error("no field rendered");
 
 // 4. Every curated field leads with its ★推荐 option and defaults to it.
-for (const sel of selects) {
-	const opts = (sel.children ?? []).filter((o) => o.type === "option");
+for (const sel of fieldSelects) {
+	const opts = optionTexts(sel);
 	if (opts.length < 2) throw new Error("every select needs at least two choices");
-	if (!opts.some((o) => textOf(o).includes("★推荐"))) throw new Error("a select is missing its ★推荐 marker: " + textOf(opts[0]));
+	if (!opts.some((t) => t.includes("★推荐"))) throw new Error("a select is missing its ★推荐 marker: " + opts[0]);
 }
 
 // 5. The three retry caps default to the unlimited option, per the user's ask.
