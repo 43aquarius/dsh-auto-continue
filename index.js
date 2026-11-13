@@ -151,7 +151,11 @@ if (z) {
 		maxIdleResumes: z.number().default(DEFAULTS.maxIdleResumes).description("每个会话在每个宿主生命周期内兜底续接的最大次数"),
 		cooldownModelFaultMs: z.number().default(DEFAULTS.cooldownModelFaultMs).description("模型级持续故障（PI_AI_ERROR/MODEL_SWITCH_COMPACTION_FAILED 等）的冷却时间（毫秒）"),
 		preferLargeContext: z.boolean().default(DEFAULTS.preferLargeContext).description("切换时优先选择上下文窗口足够大的模型，避免切过去触发历史压缩（压缩摘要仍用旧模型，旧模型限流时会失败）"),
-		minContextWindow: z.number().default(DEFAULTS.minContextWindow).description("候选模型的最小上下文窗口（token，0=不限制）；低于此值的模型不作为切换目标")
+		minContextWindow: z.number().default(DEFAULTS.minContextWindow).description("候选模型的最小上下文窗口（token，0=不限制）；低于此值的模型不作为切换目标"),
+		// Volatile: refreshed by the Host at startup so the settings panel can
+		// offer the live model catalog in its dropdown. Updates in place, never
+		// restarts the plugin, never pollutes the persisted YAML.
+		modelOptions: z.array(z.string()).default([]).volatile().description("当前已注册的模型路由（provider/model）；由插件启动时自动刷新，供设置面板下拉选择")
 	});
 }
 
@@ -221,6 +225,43 @@ export async function apply(ctx, rawConfig) {
 	}
 
 	const routeKey = (provider, model) => `${provider}/${model}`;
+
+	/**
+	 * Publish the live model catalog into the volatile `modelOptions` config
+	 * field so the settings panel's dropdown can offer every currently
+	 * registered route. Volatile fields update in place (no plugin restart)
+	 * and never persist to the profile YAML.
+	 */
+	async function refreshModelOptions() {
+		try {
+			const llm = typeof ctx.get === "function" ? ctx.get("llm") : ctx.llm;
+			if (!llm || typeof llm.listProviders !== "function" || typeof llm.listModels !== "function") return;
+			const routes = [];
+			for (const provider of llm.listProviders()) {
+				let models;
+				try { models = await llm.listModels(provider.id); } catch { continue; }
+				for (const model of Array.isArray(models) ? models : []) {
+					if (model?.id) routes.push(`${provider.id}/${model.id}`);
+				}
+			}
+			if (routes.length === 0) return;
+			const entry = ctx.fiber?.entry;
+			const editor = typeof ctx.get === "function" ? ctx.get("configEditor") : undefined;
+			if (!entry || !editor || typeof editor.edit !== "function") {
+				ctx.logger.warn("auto-continue: configEditor unavailable; settings panel will use the baked model list");
+				return;
+			}
+			await editor.edit(entry, (current) => {
+				const prev = current?.modelOptions;
+				if (Array.isArray(prev) && prev.length === routes.length && prev.every((route, i) => route === routes[i])) return current;
+				return { ...current, modelOptions: routes };
+			});
+			ctx.logger.info(`auto-continue: model catalog refreshed (${routes.length} routes) for the settings panel`);
+		} catch (error) {
+			ctx.logger.warn(`auto-continue: model catalog refresh skipped (${error instanceof Error ? error.message : String(error)})`);
+		}
+	}
+
 
 	function cooldownMsFor(code, providerRetryAfterMs) {
 		if (SWITCH_TRANSITION_CODES.has(code)) return Math.min(config.cooldownTransientMs, 60000);
@@ -558,6 +599,9 @@ export async function apply(ctx, rawConfig) {
 		disposeDisposed();
 		lifetime.abort(new Error("auto-continue plugin disposed"));
 	}, "auto-continue: dispose listeners");
+
+	// Fire-and-forget: publish the live model catalog for the settings panel.
+	void refreshModelOptions();
 }
 
 export { Config, inject, name };

@@ -36,6 +36,7 @@ window.__ModuleLoader__.load({
 			"workbuddy-vision": ["hy4free", "hy4std", "hy3", "hy3-x", "glm-5.3", "glm-5.3-flash", "glm-5.2", "deepseek-v4.1-flash", "deepseek-v4-pro", "minimax-m3.1-flash", "kimi-k3.1-pro", "kimi-k3-1", "kimi-k2.8-preview", "step-5-preview", "mimo-v2.6-pro", "space-bunny"],
 			raccoon: ["sn-deepseek-v4-1-flash-1017"],
 			"trae-vision": ["glm-5.3", "deepseek-v4.1-flash"],
+			"vision-http": ["ovh/Qwen3.5-397B-A17B"],
 			"our-free-model-vision": ["minimaxai/minimax-m3.1-flash"],
 			"kilo-auto": ["free"],
 			"deepseek-account": ["deepseek-v4-pro"]
@@ -165,6 +166,28 @@ window.__ModuleLoader__.load({
 		];
 
 		const GROUPS = [["basic", "基础"], ["behavior", "切换行为"], ["advanced", "高级（探测与冷却）"]];
+
+		/**
+		 * Namespace candidates for `configForms.get(entryId)`. The settings domain
+		 * keys a form by the Host plugin entry id; accept the row id and the
+		 * package name so the panel binds to whichever id this profile uses.
+		 * The first namespace whose snapshot reports `status === "ready"` wins.
+		 */
+		const SCOPE_CANDIDATES = ["auto-continue", "dsh-auto-continue", "dsh-auto-continue"];
+
+		function resolveScope(forms) {
+			if (!forms || typeof forms.get !== "function") return undefined;
+			let fallback;
+			for (const id of SCOPE_CANDIDATES) {
+				let scope;
+				try { scope = forms.get(id); } catch { continue; }
+				if (!scope || typeof scope.getSnapshot !== "function") continue;
+				const snap = scope.getSnapshot();
+				if (snap && snap.status === "ready") return scope;
+				if (!fallback) fallback = scope;
+			}
+			return fallback;
+		}
 		const recommendedOf = (f) => (f.options.find((o) => o.recommended) ?? f.options[0]).value;
 		const indexOfValue = (f, v) => f.options.findIndex((o) => !o.custom && eq(o.value, v));
 		const customIndex = (f) => f.options.findIndex((o) => o.custom);
@@ -254,6 +277,10 @@ window.__ModuleLoader__.load({
 		function Panel({ scope, snap }) {
 			const accepted = snap.value ?? {};
 			const writable = snap.writable !== false;
+			// `status` is "ready" only once the Host served this namespace and the
+			// value passed schema validation; anything else means writes cannot land.
+			const status = typeof snap.status === "string" ? snap.status : "ready";
+			const ready = status === "ready";
 			const revision = snap.revision ?? 0;
 			const [state, setState] = React.useState(() => initialState(accepted));
 			const [savedAt, setSavedAt] = React.useState(null);
@@ -271,13 +298,27 @@ window.__ModuleLoader__.load({
 			const dirty = FIELDS.some((f) => !eq(draft[f.key], accepted[f.key]));
 
 			const save = async () => {
-				if (!dirty || saving || typeof scope.mutate !== "function") return;
+				if (!dirty || saving) return;
+				if (!ready) { setError(`配置未就绪（status=${status}），无法保存；请确认插件行已启用后重开此页`); return; }
+				if (typeof scope.mutate !== "function") { setError("此设置域未提供保存接口（mutate 缺失），无法写入配置"); return; }
 				setSaving(true); setError(null);
 				try {
-					const ops = FIELDS.map((f) => ({ op: "set", path: [f.key], value: draft[f.key] }));
-					const result = await scope.mutate(ops, revision);
-					if (result && result.ok === false) setError(`保存被拒绝：${result.error?.message ?? "配置已变更，请重试"}`);
-					else setSavedAt(Date.now());
+					// Only send what actually changed: a smaller op set is far less
+					// likely to trip schema validation for untouched fields.
+					const ops = FIELDS
+						.filter((f) => !eq(draft[f.key], accepted[f.key]))
+						.map((f) => ({ op: "set", path: [f.key], value: draft[f.key] }));
+					if (ops.length === 0) { setSaving(false); return; }
+					// ConfigFormController.mutate resolves to a BOOLEAN:
+					// true = Host accepted, false = rejected (conflict/schema).
+					const ok = await scope.mutate(ops, snap.revision);
+					if (ok === false) setError("保存被拒绝：配置可能被更高层覆盖或版本冲突；请重开此页后重试");
+					else {
+						// Treat the accepted draft as the new baseline so the panel
+						// clears immediately instead of waiting for a mirror refresh.
+						setState(initialState({ ...accepted, ...draft }));
+						setSavedAt(Date.now());
+					}
 				} catch (e) { setError(`保存失败：${e?.message ?? String(e)}`); }
 				finally { setSaving(false); }
 			};
@@ -285,6 +326,8 @@ window.__ModuleLoader__.load({
 
 			return h("div", { "data-plugin-config": true, style: { fontSize: 13 } },
 				h("div", { style: { fontSize: 12, opacity: 0.7, marginBottom: 8 } }, "已默认选中推荐设置（★推荐）；改动后点「保存」生效。"),
+				!ready && h("p", { style: { color: "#c33", margin: "0 0 8px" } },
+					`配置服务状态：${status}（未就绪时无法保存改动）`),
 				!writable && h("p", { style: { color: "#c33" } }, "当前配置不可写（可能被更高层覆盖）"),
 				...GROUPS.map(([group, title]) =>
 					h("section", { key: title, style: { margin: "16px 0" } },
@@ -336,7 +379,7 @@ window.__ModuleLoader__.load({
 			inject: ["slots", "locale"],
 			apply(ctx) {
 				const forms = ctx.get ? ctx.get("configForms") : undefined;
-				const scope = forms && typeof forms.get === "function" ? forms.get("auto-continue") : undefined;
+				const scope = resolveScope(forms);
 				const render = () => h(AutoContinueSettings, { scope });
 				const safe = (tag, fn) => {
 					try { fn(); } catch (e) {
