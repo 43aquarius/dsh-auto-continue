@@ -1,19 +1,18 @@
 /**
  * @local/auto-continue — browser half: the bundle's settings panel.
  *
- * Option-based form (v1.3.0): every setting is a <select> with a few curated
- * choices; the one marked ★推荐 is pre-selected. This replaces the free-text
- * / number inputs of v1.2.x. Two array settings (fallbackChain, ignoreCodes)
- * additionally offer a 自定义 option that reveals a textarea.
- *
- * Registers into BOTH plugin-detail slots the Plugins page declares:
- *   - `plugins.bundle.config` (key = bundle package name) — bundle detail page
- *   - `plugins.row.config`    (key = `<pkg>#<row id>`)     — row Configure page
- * The Host Config namespace is read through the optional `configForms` service.
- * We deliberately do NOT list `configForms` in `inject`: it is not a baseline
- * Client service key, so injecting it leaves the plugin pending forever and no
- * slot ever registers (the exact bug of v1.2.0). Only `slots` + `locale` are
- * baseline; everything else is obtained with ctx.get() and degrades gracefully.
+ * Design (v1.5.0):
+ *   - EVERY setting is a choice. There is no free-text input anywhere: the
+ *     model chain is a checkbox list built from the LIVE provider catalog, and
+ *     the remaining fields are curated <select>s.
+ *   - Persistence goes through the plugin's OWN Host bridge
+ *     (`/api/dsh-auto-continue-settings`) instead of a framework config form.
+ *     This profile does not mount the shipped config-form subsystem, so the
+ *     plugin manager never hands this cell a `form`; the working plugins in
+ *     this ecosystem own their settings surface the same way. Saving is a
+ *     single POST that the Host applies with `settings.mutate`.
+ *   - Only baseline services are injected (`slots`, `locale`). Anything else
+ *     would leave the plugin pending forever and no slot would register.
  */
 window.__ModuleLoader__.load({
 	id: "@local/auto-continue",
@@ -23,18 +22,14 @@ window.__ModuleLoader__.load({
 
 		const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 		const opt = (label, value, recommended) => ({ label, value, ...(recommended ? { recommended: true } : {}) });
-		const CUSTOM = () => ({ label: "自定义（从模型列表选）…", custom: true });
+
+		const BRIDGE = "/api/dsh-auto-continue-settings";
 
 		/**
-		 * Known model routes of this deployment (provider -> model ids).
-		 * Used to populate the fallback-chain picker so a person chooses from
-		 * the current catalog instead of typing `provider/model` by hand.
-		 * A Host-provided `modelOptions` config field (if present) is merged on
-		 * top and wins, so this snapshot only matters when no live list exists.
+		 * Fallback catalog, used only until the Host answers with the live list.
+		 * The Host bridge enumerates llm.listProviders()/listModels() at request
+		 * time, so the real picker is always the current deployment's catalog.
 		 */
-		// Full baked catalog. The Host no longer pushes a live list (that path
-		// corrupted the persisted YAML and broke saving); we ship every known
-		// route here so the dropdown is always complete across restarts.
 		const FREE_MODELS = [
 			"big-pickle", "mimo-v2.6-flash-free", "deepseek-v4.1-flash-free",
 			"glm-5.3-flash-free", "longcat-2.5-free", "iceman-free",
@@ -65,63 +60,48 @@ window.__ModuleLoader__.load({
 			"kilo-auto": ["free"],
 			"deepseek-account": ["deepseek-v4-pro"]
 		};
-		const modelChoices = (extra) => {
+		const bakedRoutes = () => {
 			const all = [];
-			const push = (route) => {
-				const s = String(route ?? "").trim();
-				if (s === "" || all.includes(s)) return;
-				all.push(s);
-			};
 			for (const [provider, models] of Object.entries(KNOWN_MODELS)) {
-				for (const model of models) push(`${provider}/${model}`);
+				for (const model of models) {
+					const route = `${provider}/${model}`;
+					if (!all.includes(route)) all.push(route);
+				}
 			}
-			for (const route of Array.isArray(extra) ? extra : []) push(route);
 			return all;
 		};
 
-		// Text <-> array codecs for the two custom-capable fields.
-		const toText = (key, v) => key === "ignoreCodes"
-			? (Array.isArray(v) ? v.join(", ") : String(v ?? ""))
-			: (Array.isArray(v) ? v.join("\n") : String(v ?? ""));
-		const fromText = (key, s) => key === "ignoreCodes"
-			? String(s ?? "").split(/[,，\n]/).map((x) => x.trim()).filter(Boolean)
-			: String(s ?? "").split("\n").map((x) => x.trim()).filter(Boolean);
-
 		/**
-		 * Field schema: { key, label, hint, group, options[], custom? }
-		 * options[].value is the REAL config value (any type); the <select>
+		 * Field schema. `options[].value` is the REAL config value; the <select>
 		 * uses the option index as its DOM value so complex values stay intact.
-		 * The option with recommended:true is the default selection.
+		 * A field with `kind: "chain"` renders the live model picker instead.
 		 */
 		const FIELDS = [
-			// ---- 基础 ----
 			{
 				key: "enabled", label: "总开关", hint: "关闭后插件不介入任何失败", group: "basic",
 				options: [opt("开启自动续接（推荐）", true, true), opt("关闭（不介入任何失败）", false)]
 			},
 			{
-				key: "continuationText", label: "续接消息文本", hint: "切换模型后自动补发的消息", group: "basic",
-				options: [opt("继续（推荐）", "继续", true), opt("继续完成上面的任务", "继续完成上面的任务"), opt("请从中断处继续", "请从中断处继续")]
-			},
-			{
-				key: "fallbackChain", label: "优先切换模型链", hint: "按顺序尝试；选「自定义」后可从当前模型列表下拉逐个加入（也可手填 provider/model）", group: "basic", custom: true,
+				key: "continuationText", label: "续接消息文本", hint: "切换模型后自动补发的消息（仅预设）", group: "basic",
 				options: [
-					opt("自动枚举全部可用模型（推荐）", [], true),
-					opt("优先 DeepSeek 官方模型", ["deepseek-account/deepseek-v4-pro"]),
-					opt("优先免费大窗口模型", ["workbuddy-vision/hy4free", "our-free-model-vision/minimaxai/minimax-m3.1-flash"]),
-					CUSTOM()
+					opt("继续（推荐）", "继续", true),
+					opt("继续完成上面的任务", "继续完成上面的任务"),
+					opt("请从中断处继续", "请从中断处继续"),
+					opt("接着做，不用解释", "接着做，不用解释")
 				]
 			},
 			{
-				key: "ignoreCodes", label: "忽略的错误码", hint: "这些错误码不触发切换、原样报错", group: "basic", custom: true,
+				key: "fallbackChain", label: "优先切换模型链", hint: "勾选即按顺序优先尝试；不勾选＝自动枚举全部可用模型", group: "basic",
+				kind: "chain"
+			},
+			{
+				key: "ignoreCodes", label: "忽略的错误码", hint: "这些错误码不触发切换、原样报错（仅预设）", group: "basic",
 				options: [
 					opt("默认（推荐）", ["ABORTED", "IMAGE_OFFLOAD_REQUIRED"], true),
 					opt("仅忽略用户中止", ["ABORTED"]),
-					opt("不忽略（所有失败都尝试切换）", []),
-					CUSTOM()
+					opt("不忽略（所有失败都尝试切换）", [])
 				]
 			},
-			// ---- 切换行为 ----
 			{
 				key: "probe", label: "切换前探测", hint: "先发极小真实请求验证候选模型可用，避免切到死模型", group: "behavior",
 				options: [opt("开启（推荐）", true, true), opt("关闭（直接切第一个候选）", false)]
@@ -143,12 +123,11 @@ window.__ModuleLoader__.load({
 				options: [opt("开启（推荐）", true, true), opt("关闭（只在请求失败时介入）", false)]
 			},
 			{
-				key: "maxIdleResumes", label: "兜底续接上限", hint: "每会话每宿主生命周期内的最大兜底次数；0=不限制（推荐，但有内置安全上限防止死循环）", group: "behavior",
+				key: "maxIdleResumes", label: "兜底续接上限", hint: "每会话每宿主生命周期内的最大兜底次数；0=不限制（推荐，有内置安全上限防死循环）", group: "behavior",
 				options: [opt("不限制（推荐）", 0, true), opt("1 次", 1), opt("2 次", 2), opt("3 次", 3), opt("5 次", 5), opt("10 次", 10)]
 			},
-			// ---- 高级 ----
 			{
-				key: "preferLargeContext", label: "优先选大窗口模型", hint: "目标窗口不小于当前模型，避免切换触发历史压缩（压缩摘要用旧模型，旧模型限流会失败）", group: "advanced",
+				key: "preferLargeContext", label: "优先选大窗口模型", hint: "目标窗口不小于当前模型，避免切换触发历史压缩", group: "advanced",
 				options: [opt("开启（推荐）", true, true), opt("关闭（按注册顺序选）", false)]
 			},
 			{
@@ -180,7 +159,7 @@ window.__ModuleLoader__.load({
 				options: [opt("1 分钟", 60000), opt("2 分钟（推荐）", 120000, true), opt("5 分钟", 300000), opt("10 分钟", 600000)]
 			},
 			{
-				key: "cooldownModelFaultMs", label: "模型故障冷却", hint: "模型级持续故障（PI_AI_ERROR 等）的冷却时长", group: "advanced",
+				key: "cooldownModelFaultMs", label: "模型故障冷却", hint: "模型级持续故障的冷却时长", group: "advanced",
 				options: [opt("10 分钟", 600000), opt("30 分钟（推荐）", 1800000, true), opt("1 小时", 3600000), opt("2 小时", 7200000)]
 			},
 			{
@@ -191,223 +170,241 @@ window.__ModuleLoader__.load({
 
 		const GROUPS = [["basic", "基础"], ["behavior", "切换行为"], ["advanced", "高级（探测与冷却）"]];
 
-		/**
-		 * Namespace candidates for `configForms.get(entryId)`. The settings domain
-		 * keys a form by the Host plugin entry id; accept the row id and the
-		 * package name so the panel binds to whichever id this profile uses.
-		 * The first namespace whose snapshot reports `status === "ready"` wins.
-		 */
-		const SCOPE_CANDIDATES = ["auto-continue", "@local/auto-continue", "dsh-auto-continue"];
-
-		function resolveScope(forms) {
-			if (!forms || typeof forms.get !== "function") return undefined;
-			let fallback;
-			for (const id of SCOPE_CANDIDATES) {
-				let scope;
-				try { scope = forms.get(id); } catch { continue; }
-				if (!scope || typeof scope.getSnapshot !== "function") continue;
-				const snap = scope.getSnapshot();
-				if (snap && snap.status === "ready") return scope;
-				if (!fallback) fallback = scope;
-			}
-			return fallback;
-		}
 		const recommendedOf = (f) => (f.options.find((o) => o.recommended) ?? f.options[0]).value;
-		const indexOfValue = (f, v) => f.options.findIndex((o) => !o.custom && eq(o.value, v));
-		const customIndex = (f) => f.options.findIndex((o) => o.custom);
+		const indexOfValue = (f, v) => f.options.findIndex((o) => eq(o.value, v));
 
 		const selectStyle = { width: "100%", boxSizing: "border-box", fontSize: 13, padding: "4px 6px" };
-		const areaStyle = { width: "100%", boxSizing: "border-box", fontSize: 12, fontFamily: "var(--dsh-font-mono, monospace)", marginTop: 6, resize: "vertical" };
-		const rowStyle = { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 10 };
 		const labelStyle = { flex: "0 0 210px", fontSize: 13, lineHeight: "26px", opacity: 0.9 };
+		const rowStyle = { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 10 };
 
-		function FieldRow({ field, value, isCustom, onSelect, onCustomText, onPickModel, onRemoveChain, modelChoices: choices, disabled }) {
-			const idx = isCustom
-				? customIndex(field)
-				: (() => { const i = indexOfValue(field, value); return i >= 0 ? i : (field.custom ? customIndex(field) : 0); })();
-			const selector = h("select", {
-				value: String(idx), disabled, style: selectStyle,
+		function SelectField({ field, value, onChange, disabled }) {
+			const found = indexOfValue(field, value);
+			const idx = found >= 0 ? found : field.options.findIndex((o) => o.recommended);
+			return h("select", {
+				value: String(idx < 0 ? 0 : idx),
+				disabled,
+				style: selectStyle,
 				onChange: (e) => {
-					const i = Number(e.target.value);
-					const o = field.options[i];
-					if (o && o.custom) onSelect(field, true, value);
-					else onSelect(field, false, o.value);
+					const chosen = field.options[Number(e.target.value)];
+					if (chosen) onChange(field.key, chosen.value);
 				}
 			}, field.options.map((o, i) => h("option", { key: i, value: String(i) }, o.label + (o.recommended ? " ★推荐" : ""))));
-			const showCustom = field.custom && (isCustom || idx === customIndex(field));
-			let extra = null;
-			if (showCustom && field.key === "fallbackChain") {
-				// Model picker: choose from the current catalog instead of typing.
-				const chain = Array.isArray(value) ? value : [];
-				const available = (choices || []).filter((route) => !chain.includes(route));
-				extra = h("div", null,
-					h("div", { style: { display: "flex", gap: 6, marginTop: 6 } },
-						h("select", {
-							value: "", disabled: disabled || available.length === 0, style: { ...selectStyle, flex: 1 },
-							onChange: (e) => {
-								const picked = e.target.value;
-								if (picked) onPickModel(field, picked);
-								e.target.value = "";
-							}
-						},
-						[
-							h("option", { key: "__placeholder", value: "" }, available.length ? "从当前模型列表选择…" : "（当前列表已全部加入）"),
-							...available.map((route, i) => h("option", { key: route + i, value: route }, route))
-						]),
-						h("button", {
-							type: "button", disabled: disabled || chain.length === 0,
-							onClick: () => onCustomText(field, ""), title: "清空模型链"
-						}, "清空")),
-					chain.length > 0
-						? h("ol", { style: { margin: "6px 0 0 18px", padding: 0, fontSize: 12 } },
-							chain.map((route, i) => h("li", { key: route + i, style: { marginBottom: 2 } },
-								h("span", { style: { fontFamily: "var(--dsh-font-mono, monospace)" } }, route),
-								h("button", {
-									type: "button", disabled, style: { marginLeft: 8, fontSize: 11 },
-									onClick: () => onRemoveChain(field, i)
-								}, "移除"))))
-						: h("div", { style: { fontSize: 11, opacity: 0.55, marginTop: 6 } }, "还没有加入模型；可从上方下拉列表逐个添加。"),
-					h("textarea", {
-						value: toText(field.key, value), rows: 3, disabled,
-						placeholder: "也可直接手填，一行一个：\nworkbuddy-vision/glm-5.3\nraccoon/sn-deepseek-v4-1-flash-1017",
-						style: areaStyle,
-						onChange: (e) => onCustomText(field, e.target.value)
-					}));
-			} else if (showCustom) {
-				extra = h("textarea", {
-					value: toText(field.key, value), rows: 2, disabled,
-					placeholder: "ABORTED, IMAGE_OFFLOAD_REQUIRED",
-					style: areaStyle,
-					onChange: (e) => onCustomText(field, e.target.value)
-				});
-			}
-			return h("div", { style: rowStyle },
-				h("label", { style: labelStyle }, field.label),
-				h("div", { style: { flex: 1, minWidth: 0 } }, selector, extra,
-					field.hint ? h("div", { style: { fontSize: 11, opacity: 0.55, marginTop: 3 } }, field.hint) : null));
 		}
 
-		function initialState(accepted) {
-			const d = {}, c = {};
-			for (const f of FIELDS) {
-				const v = accepted[f.key];
-				if (v !== undefined && indexOfValue(f, v) >= 0) { d[f.key] = v; }
-				else if (f.custom && v !== undefined) { d[f.key] = v; c[f.key] = true; }
-				else d[f.key] = recommendedOf(f);
-			}
-			return { d, c };
-		}
-
-		function Panel({ scope, snap }) {
-			const accepted = snap.value ?? {};
-			const writable = snap.writable !== false;
-			// `status` is "ready" only once the Host served this namespace and the
-			// value passed schema validation; anything else means writes cannot land.
-			const status = typeof snap.status === "string" ? snap.status : "ready";
-			const ready = status === "ready";
-			const revision = snap.revision ?? 0;
-			const [state, setState] = React.useState(() => initialState(accepted));
-			const [savedAt, setSavedAt] = React.useState(null);
-			const [error, setError] = React.useState(null);
-			const [saving, setSaving] = React.useState(false);
-			const draft = state.d, custom = state.c;
-			// Live model routes if the Host ever publishes them; the baked
-			// catalog covers deployments that do not.
-			const choices = React.useMemo(() => modelChoices(accepted.modelOptions), [accepted.modelOptions]);
-
-			const setVal = (key, val, isCustom) => {
-				setState((s) => ({ d: { ...s.d, [key]: val }, c: { ...s.c, [key]: !!isCustom } }));
-				setError(null);
+		/** Ordered checkbox list over the LIVE model catalog. No text input. */
+		function ChainField({ value, models, onChange, disabled }) {
+			const chain = Array.isArray(value) ? value.filter((x) => typeof x === "string") : [];
+			const catalog = models.length ? models : bakedRoutes();
+			const toggle = (route) => {
+				const next = chain.includes(route) ? chain.filter((x) => x !== route) : [...chain, route];
+				onChange("fallbackChain", next);
 			};
-			const dirty = FIELDS.some((f) => !eq(draft[f.key], accepted[f.key]));
+			const move = (route, delta) => {
+				const at = chain.indexOf(route);
+				if (at < 0) return;
+				const to = at + delta;
+				if (to < 0 || to >= chain.length) return;
+				const next = chain.slice();
+				const [item] = next.splice(at, 1);
+				next.splice(to, 0, item);
+				onChange("fallbackChain", next);
+			};
+			return h("div", null,
+				h("div", { style: { fontSize: 12, opacity: 0.75, marginBottom: 6 } },
+					chain.length === 0
+						? "未勾选任何模型 → 自动枚举全部可用模型（按窗口大小与健康状态择优）"
+						: `已选 ${chain.length} 个，按顺序优先尝试：`),
+				chain.length === 0 ? null : h("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 } },
+					chain.map((route, i) => h("span", {
+						key: route,
+						style: {
+							display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12,
+							border: "1px solid var(--dsw-alias-border-secondary, #d0d0d0)",
+							borderRadius: 12, padding: "2px 6px 2px 10px"
+						}
+					},
+						h("span", null, `${i + 1}. ${route}`),
+						h("button", { type: "button", disabled: disabled || i === 0, title: "上移", onClick: () => move(route, -1), style: { cursor: "pointer", border: "none", background: "transparent", opacity: i === 0 ? 0.3 : 0.8 } }, "↑"),
+						h("button", { type: "button", disabled: disabled || i === chain.length - 1, title: "下移", onClick: () => move(route, 1), style: { cursor: "pointer", border: "none", background: "transparent", opacity: i === chain.length - 1 ? 0.3 : 0.8 } }, "↓"),
+						h("button", { type: "button", disabled, title: "移除", onClick: () => toggle(route), style: { cursor: "pointer", border: "none", background: "transparent" } }, "×")
+					))
+				),
+				h("div", {
+					style: {
+						maxHeight: 240, overflowY: "auto", border: "1px solid var(--dsw-alias-border-secondary, #d0d0d0)",
+						borderRadius: 6, padding: 8
+					}
+				},
+					catalog.map((route) => h("label", {
+						key: route,
+						style: { display: "flex", alignItems: "center", gap: 6, fontSize: 12, lineHeight: "20px", cursor: "pointer" }
+					},
+						h("input", {
+							type: "checkbox",
+							checked: chain.includes(route),
+							disabled,
+							onChange: () => toggle(route)
+						}),
+						h("span", null, route)
+					))
+				)
+			);
+		}
+
+		function Panel({ initial, models, writable }) {
+			const [draft, setDraft] = React.useState(() => {
+				const seed = {};
+				for (const field of FIELDS) {
+					const key = field.key;
+					const value = initial && Object.prototype.hasOwnProperty.call(initial, key) ? initial[key] : undefined;
+					seed[key] = value !== undefined ? value : (field.kind === "chain" ? [] : recommendedOf(field));
+				}
+				return seed;
+			});
+			const [busy, setBusy] = React.useState(false);
+			const [error, setError] = React.useState("");
+			const [notice, setNotice] = React.useState("");
+
+			const setField = (key, value) => {
+				setDraft((prev) => ({ ...prev, [key]: value }));
+				setNotice("");
+				setError("");
+			};
+			// Only compare keys the Host actually reported: a field absent from the
+			// answer was never set by the user, so showing it as "dirty" on first
+			// paint would leave the save control enabled before any edit.
+			const dirtyKeys = FIELDS
+				.map((f) => f.key)
+				.filter((key) => initial && Object.prototype.hasOwnProperty.call(initial, key))
+				.filter((key) => !eq(draft[key], initial[key]));
+			const dirty = dirtyKeys.length > 0;
 
 			const save = async () => {
-				if (!dirty || saving) return;
-				if (!ready) { setError(`配置未就绪（status=${status}），无法保存；请确认插件行已启用后重开此页`); return; }
-				if (typeof scope.mutate !== "function") { setError("此设置域未提供保存接口（mutate 缺失），无法写入配置"); return; }
-				setSaving(true); setError(null);
+				if (!writable || busy || !dirty) return;
+				setBusy(true);
+				setError("");
+				setNotice("");
 				try {
-					// Only send what actually changed: a smaller op set is far less
-					// likely to trip schema validation for untouched fields.
-					const ops = FIELDS
-						.filter((f) => !eq(draft[f.key], accepted[f.key]))
-						.map((f) => ({ op: "set", path: [f.key], value: draft[f.key] }));
-					if (ops.length === 0) { setSaving(false); return; }
-					// ConfigFormController.mutate resolves to a BOOLEAN:
-					// true = Host accepted, false = rejected (conflict/schema).
-					const ok = await scope.mutate(ops, snap.revision);
-					if (ok === false) setError("保存被拒绝：配置可能被更高层覆盖或版本冲突；请重开此页后重试");
-					else {
-						// Treat the accepted draft as the new baseline so the panel
-						// clears immediately instead of waiting for a mirror refresh.
-						setState(initialState({ ...accepted, ...draft }));
-						setSavedAt(Date.now());
+					const ops = dirtyKeys.map((key) => ({ op: "set", path: [key], value: draft[key] }));
+					const res = await fetch(`${BRIDGE}/save`, {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({ ops })
+					});
+					const body = await res.json().catch(() => ({}));
+					if (!res.ok || body?.ok !== true) {
+						setError(`保存失败：${body?.message ?? body?.code ?? `HTTP ${res.status}`}`);
+						return;
 					}
-				} catch (e) { setError(`保存失败：${e?.message ?? String(e)}`); }
-				finally { setSaving(false); }
+					setNotice("已保存（下次加载配置时生效）");
+				} catch (e) {
+					setError(`保存请求失败：${e && e.message ? e.message : String(e)}`);
+				} finally {
+					setBusy(false);
+				}
 			};
-			const resetRecommended = () => { setState(initialState({})); setError(null); setSavedAt(null); };
+
+			const sections = GROUPS.map(([group, title]) => {
+				const fields = FIELDS.filter((f) => f.group === group);
+				if (fields.length === 0) return null;
+				return h("div", { key: group, style: { marginBottom: 18 } },
+					h("div", { style: { fontSize: 13, fontWeight: 600, margin: "0 0 8px" } }, title),
+					fields.map((field) => h("div", { key: field.key, style: rowStyle },
+						h("div", { style: labelStyle }, field.label),
+						h("div", { style: { flex: 1, minWidth: 0 } },
+							field.kind === "chain"
+								? h(ChainField, {
+									value: draft[field.key],
+									models,
+									disabled: busy || !writable,
+									onChange: setField
+								})
+								: h(SelectField, {
+									field,
+									value: draft[field.key],
+									disabled: busy || !writable,
+									onChange: setField
+								}),
+							h("div", { style: { fontSize: 11, opacity: 0.6, marginTop: 4 } }, field.hint)
+						)
+					))
+				);
+			});
 
 			return h("div", { "data-plugin-config": true, style: { fontSize: 13 } },
-				h("div", { style: { fontSize: 12, opacity: 0.7, marginBottom: 8 } }, "已默认选中推荐设置（★推荐）；改动后点「保存」生效。"),
-				!ready && h("p", { style: { color: "#c33", margin: "0 0 8px" } },
-					`配置服务状态：${status}（未就绪时无法保存改动）`),
-				!writable && h("p", { style: { color: "#c33" } }, "当前配置不可写（可能被更高层覆盖）"),
-				...GROUPS.map(([group, title]) =>
-					h("section", { key: title, style: { margin: "16px 0" } },
-						h("h3", { style: { fontSize: 13, margin: "0 0 8px", opacity: 0.85 } }, title),
-						FIELDS.filter((f) => f.group === group).map((f) =>
-							h(FieldRow, {
-								key: f.key, field: f, value: draft[f.key], isCustom: !!custom[f.key], disabled: !writable,
-								modelChoices: choices,
-								onSelect: (field, isCustom, val) => setVal(field.key, val, isCustom),
-								onCustomText: (field, text) => setVal(field.key, fromText(field.key, text), true),
-								onPickModel: (field, route) => {
-									const cur = Array.isArray(draft[field.key]) ? draft[field.key] : [];
-									if (cur.includes(route)) return;
-									setVal(field.key, [...cur, route], true);
-								},
-								onRemoveChain: (field, index) => {
-									const cur = Array.isArray(draft[field.key]) ? draft[field.key] : [];
-									setVal(field.key, cur.filter((_, i) => i !== index), true);
-								}
-							})))),
-				h("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 16, flexWrap: "wrap" } },
-					h("button", { type: "button", disabled: !dirty || saving || !writable, onClick: save }, saving ? "保存中…" : "保存"),
-					h("button", { type: "button", disabled: !dirty || saving, onClick: () => { setState(initialState(accepted)); setError(null); } }, "撤销改动"),
-					h("button", { type: "button", disabled: saving || !writable, onClick: resetRecommended }, "恢复推荐设置"),
-					dirty && h("span", { style: { fontSize: 12, opacity: 0.6 } }, "有未保存的修改"),
-					savedAt && !dirty && !error && h("span", { style: { fontSize: 12, opacity: 0.6 } }, "已保存"),
-					error && h("span", { style: { fontSize: 12, color: "#c33" } }, error)));
+				!writable ? h("p", { style: { color: "#c33", margin: "0 0 8px" } },
+					"配置暂时只读：Host 配置服务不可用，重启 DSH 后再试。") : null,
+				sections,
+				h("div", { style: { display: "flex", alignItems: "center", gap: 12, marginTop: 6 } },
+					h("button", {
+						type: "button",
+						disabled: busy || !writable || !dirty,
+						onClick: save,
+						style: { fontSize: 13, padding: "5px 14px", cursor: busy || !writable || !dirty ? "default" : "pointer" }
+					}, busy ? "保存中…" : "保存"),
+					h("span", { style: { fontSize: 12, opacity: 0.7 } },
+						dirty ? `有 ${dirtyKeys.length} 项未保存的修改` : "没有未保存的修改"),
+					error ? h("span", { style: { fontSize: 12, color: "#c33" } }, error) : null,
+					!error && notice ? h("span", { style: { fontSize: 12, color: "#2a7" } }, notice) : null
+				)
+			);
 		}
 
-		function AutoContinueSettings({ scope }) {
-			const [, setVersion] = React.useState(0);
+		/** Loads the Host state, then renders the panel (or a readable failure). */
+		function AutoContinueSettings() {
+			const [state, setState] = React.useState({ phase: "loading" });
 			React.useEffect(() => {
-				if (!scope || typeof scope.subscribe !== "function") return undefined;
-				return scope.subscribe(() => setVersion((n) => n + 1));
-			}, [scope]);
-			const snap = scope && typeof scope.getSnapshot === "function" ? scope.getSnapshot() : undefined;
-			if (!snap) {
-				return h("div", { "data-plugin-config": true, style: { fontSize: 13, opacity: 0.7 } },
-					"配置服务暂不可用；请确认 Host 侧 auto-continue 行已启用，或重启 DSH。");
+				let cancelled = false;
+				(async () => {
+					try {
+						const res = await fetch(`${BRIDGE}/state`, { method: "GET" });
+						const body = await res.json().catch(() => ({}));
+						if (cancelled) return;
+						if (!res.ok || body?.ok !== true) {
+							setState({ phase: "failed", message: body?.message ?? `HTTP ${res.status}` });
+							return;
+						}
+						setState({
+							phase: "ready",
+							config: body.config ?? {},
+							writable: body.writable !== false,
+							models: Array.isArray(body.models)
+								? body.models.map((m) => (typeof m === "string" ? m : m?.route)).filter((x) => typeof x === "string" && x !== "")
+								: []
+						});
+					} catch (e) {
+						if (!cancelled) setState({ phase: "failed", message: e && e.message ? e.message : String(e) });
+					}
+				})();
+				return () => { cancelled = true; };
+			}, []);
+			if (state.phase === "loading") {
+				return h("div", { "data-plugin-config": true, style: { fontSize: 13, opacity: 0.7 } }, "正在读取配置…");
 			}
-			// Keying on revision remounts on external config changes, so all hooks
-			// inside Panel run unconditionally before any early return.
-			return h(Panel, { key: snap.revision ?? 0, scope, snap });
+			if (state.phase === "failed") {
+				return h("div", { "data-plugin-config": true, style: { fontSize: 13 } },
+					h("p", { style: { color: "#c33", margin: "0 0 6px" } }, "无法读取配置"),
+					h("p", { style: { opacity: 0.75, margin: 0 } },
+						`${state.message ?? "未知错误"}。若刚安装或升级，请重启 DSH 后重开此页。`));
+			}
+			return h(Panel, {
+				key: JSON.stringify(state.config),
+				initial: state.config,
+				models: state.models ?? [],
+				writable: state.writable
+			});
 		}
 
 		return {
-			// Baseline Client service keys only. Adding a non-baseline key here
-			// leaves the plugin pending forever and no slot ever registers.
+			// Baseline Client service keys only.
 			inject: ["slots", "locale"],
 			apply(ctx) {
-				const forms = ctx.get ? ctx.get("configForms") : undefined;
-				const scope = resolveScope(forms);
-				const render = () => h(AutoContinueSettings, { scope });
+				const render = () => h(AutoContinueSettings, null);
 				const safe = (tag, fn) => {
 					try { fn(); } catch (e) {
-						if (ctx.logger && ctx.logger.warn) ctx.logger.warn(`auto-continue: ${tag} failed: ${e && e.message ? e.message : String(e)}`);
+						if (ctx.logger && ctx.logger.warn) {
+							ctx.logger.warn(`auto-continue: ${tag} failed: ${e && e.message ? e.message : String(e)}`);
+						}
 					}
 				};
 				// Bundle detail page.
@@ -419,7 +416,7 @@ window.__ModuleLoader__.load({
 					ctx.slots.inject("plugins.row.config", () =>
 						ctx.slots.register({ name: "plugins.row.config", key: "@local/auto-continue#auto-continue" },
 							(slotProps) => slotProps && slotProps.view === "summary"
-								? h("span", null, "自动续接与模型切换 · 可配置优先模型链、探测与冷却")
+								? h("span", null, "自动续接与模型切换 · 优先模型链、探测与冷却")
 								: render())));
 			}
 		};

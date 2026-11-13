@@ -37,6 +37,14 @@ const name = "auto-continue";
 
 const inject = ["llm"];
 
+/**
+ * Config namespace of this plugin: the Loader entry id the bundle's
+ * cordis.patch.yml declares. The settings service keys namespaces by it.
+ */
+const SETTINGS_NS = "auto-continue";
+/** Own settings bridge: the settings page talks to these routes, not the SSO form. */
+const BRIDGE_PREFIX = "/api/dsh-auto-continue-settings";
+
 /** Fallback values used when no Config schema row exists. */
 const DEFAULTS = {
 	enabled: true,
@@ -565,6 +573,143 @@ export async function apply(ctx, rawConfig) {
 		pendingResume.delete(agent.id);
 		idleResumes.delete(agent.id);
 	}, GLOBAL);
+	// ── Settings bridge ────────────────────────────────────────────────────
+	// This profile does not mount the shipped config-form subsystem, so the
+	// plugin-manager never hands our settings cell a `form`. The working
+	// plugins in this ecosystem therefore own their settings surface: a pair
+	// of loopback HTTP routes on top of the Host `settings` service. Saving
+	// goes through `settings.mutate`, which is the supported writer — it does
+	// not poison the namespace the way an ad-hoc configEditor.edit did.
+	// Guarded: a host without optional injection still gets the switching
+	// behaviour, it just has no settings surface.
+	if (typeof ctx.inject === "function") ctx.inject(["webServer"], (sctx) => {
+		const sendJson = (res, status, payload) => {
+			try {
+				res.statusCode = status;
+				res.setHeader("content-type", "application/json; charset=utf-8");
+				res.setHeader("cache-control", "no-store");
+				res.end(JSON.stringify(payload));
+			} catch { /* socket already closed */ }
+		};
+		const isLoopback = (req) => {
+			const address = String(req?.socket?.remoteAddress ?? "");
+			return address === "" || address === "::1" || address.startsWith("127.") || address.startsWith("::ffff:127.");
+		};
+		const readBody = (req) => new Promise((resolve) => {
+			const chunks = [];
+			let size = 0;
+			let settled = false;
+			const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+			req.on("data", (chunk) => {
+				size += chunk.length;
+				if (size > 512 * 1024) { done(undefined); return; }
+				chunks.push(chunk);
+			});
+			req.on("end", () => {
+				const text = Buffer.concat(chunks).toString("utf8");
+				if (text === "") return done({});
+				try { done(JSON.parse(text)); } catch { done(undefined); }
+			});
+			req.on("error", () => done(undefined));
+		});
+		const settingsOf = () => {
+			try { return typeof sctx.get === "function" ? sctx.get("settings") : undefined; }
+			catch { return undefined; }
+		};
+		/** Every route the profile's providers expose right now, for the pickers. */
+		const modelCatalog = async () => {
+			const routes = [];
+			let providers = [];
+			try { providers = ctx.llm.listProviders() ?? []; } catch { providers = []; }
+			for (const provider of providers) {
+				const providerId = typeof provider === "string" ? provider : provider?.id;
+				if (!providerId) continue;
+				let models = [];
+				try { models = (await ctx.llm.listModels(providerId)) ?? []; } catch { continue; }
+				for (const model of models) {
+					const modelId = typeof model === "string" ? model : model?.id;
+					if (!modelId) continue;
+					routes.push({
+						provider: providerId,
+						model: modelId,
+						route: `${providerId}/${modelId}`,
+						contextWindow: Number(model?.contextWindow) || 0
+					});
+				}
+			}
+			routes.sort((a, b) => a.route.localeCompare(b.route));
+			return routes;
+		};
+		const readState = async () => {
+			const settings = settingsOf();
+			let value = config;
+			let writable = Boolean(settings && typeof settings.mutate === "function");
+			if (settings && typeof settings.describe === "function") {
+				try {
+					const descriptors = settings.describe({ redactSecrets: true }) ?? [];
+					const own = descriptors.find((entry) => String(entry?.ns) === SETTINGS_NS);
+					if (own && own.value && typeof own.value === "object") value = own.value;
+					if (own && own.writable === false) writable = false;
+				} catch (error) {
+					ctx.logger.warn(`auto-continue: settings.describe failed (${error instanceof Error ? error.message : String(error)})`);
+				}
+			}
+			return { ok: true, writable, config: normalizeConfig(value), models: await modelCatalog() };
+		};
+		const writeState = async (body) => {
+			const settings = settingsOf();
+			if (!settings || typeof settings.mutate !== "function") {
+				return { ok: false, code: "settings-unavailable", message: "Host settings service is not available" };
+			}
+			const raw = Array.isArray(body?.ops) ? body.ops : [];
+			const ops = raw.filter((op) => op && typeof op.op === "string" && Array.isArray(op.path) && op.path.length > 0);
+			if (ops.length === 0) return { ok: false, code: "settings-rejected", message: "no usable ops" };
+			try {
+				// No expectedRevision on purpose: a stale revision must never turn the
+				// user's save into a conflict. This bridge is the only writer here.
+				await settings.mutate(SETTINGS_NS, ops);
+			} catch (error) {
+				return { ok: false, code: "settings-failed", message: error instanceof Error ? error.message : String(error) };
+			}
+			return { ok: true, saved: ops.length };
+		};
+		sctx.effect(() => {
+			const routes = [
+				{
+					kind: "exact",
+					path: `${BRIDGE_PREFIX}/state`,
+					handler: async (req, res) => {
+						if (!isLoopback(req)) return sendJson(res, 403, { ok: false, message: "loopback only" });
+						try { sendJson(res, 200, await readState()); }
+						catch (error) { sendJson(res, 500, { ok: false, message: error instanceof Error ? error.message : String(error) }); }
+					}
+				},
+				{
+					kind: "exact",
+					path: `${BRIDGE_PREFIX}/save`,
+					handler: async (req, res) => {
+						if (!isLoopback(req)) return sendJson(res, 403, { ok: false, message: "loopback only" });
+						const body = await readBody(req);
+						if (body === undefined) return sendJson(res, 400, { ok: false, message: "malformed JSON body" });
+						try { sendJson(res, 200, await writeState(body)); }
+						catch (error) { sendJson(res, 500, { ok: false, message: error instanceof Error ? error.message : String(error) }); }
+					}
+				}
+			];
+			let disposers = [];
+			try {
+				disposers = routes.map((route) => sctx.webServer.register(route));
+			} catch (error) {
+				ctx.logger.warn(`auto-continue: settings bridge registration failed (${error instanceof Error ? error.message : String(error)})`);
+			}
+			return () => {
+				for (const dispose of disposers) {
+					try { dispose(); } catch { /* already disposed */ }
+				}
+			};
+		}, "auto-continue: settings bridge");
+	});
+
 	ctx.effect(() => async () => {
 		disposeRequestError();
 		disposeTurnStopping();
