@@ -1,13 +1,13 @@
 /**
- * Deterministic unit test for @local/auto-continue's switching logic.
+ * Deterministic unit test for dsh-auto-continue's switching logic.
  * Mocks the llm registry + agent surface, drives the real plugin code
  * through a request-error, and asserts the full switch chain.
  */
-import { pathToFileURL, fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
 import path from "node:path";
 import assert from "node:assert";
 
-const BUNDLE = fileURLToPath(new URL("..", import.meta.url));
+const BUNDLE = path.join(__dirname, "..");
 
 /** Build a fake provider catalog. raccoon-vision is storming (429), others healthy. */
 function makeLlm({ stormRaccoon = true } = {}) {

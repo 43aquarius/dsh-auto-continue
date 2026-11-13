@@ -1,5 +1,5 @@
 /**
- * @local/auto-continue — auto-continue interrupted sessions by switching models.
+ * dsh-auto-continue — auto-continue interrupted sessions by switching models.
  *
  * Hooks the agent loop's `agent/request-error` waterfall. When a request fails
  * with a switchable failure (quota exhausted, rate limit, reset windows,
@@ -162,8 +162,33 @@ const MODEL_FAULT_CODES = new Set(["PI_AI_ERROR"]);
 const SWITCH_TRANSITION_CODES = new Set(["MODEL_SWITCH_COMPACTION_FAILED"]);
 const AUTH_CODES = new Set(["AUTH", "INVALID_CREDENTIAL", "MISSING_CREDENTIAL"]);
 
+/**
+ * Coerce every config field to the shape the runtime expects. A hand-edited
+ * profile YAML, a partially written config, or a value from an older schema
+ * can otherwise crash a request-error waterfall (e.g. `null.includes` or
+ * `for...of 42`). Unknown keys are preserved; invalid known keys fall back to
+ * DEFAULTS so the plugin degrades instead of taking the session down.
+ */
+function normalizeConfig(raw) {
+	const out = { ...DEFAULTS, ...(raw && typeof raw === "object" ? raw : {}) };
+	const bool = (key) => { if (typeof out[key] !== "boolean") out[key] = DEFAULTS[key]; };
+	const num = (key) => { if (!Number.isFinite(out[key])) out[key] = DEFAULTS[key]; };
+	const str = (key) => { if (typeof out[key] !== "string") out[key] = DEFAULTS[key]; };
+	const strArray = (key) => {
+		if (!Array.isArray(out[key]) || out[key].some((x) => typeof x !== "string")) out[key] = DEFAULTS[key];
+	};
+	for (const k of ["enabled", "probe", "resumeOnErrorIdle", "preferLargeContext"]) bool(k);
+	for (const k of ["maxSwitchesPerTurn", "probeTimeoutMs", "probeMaxTokens", "maxProbeCandidates",
+		"switchAfterMs", "cooldownQuotaMs", "cooldownRateLimitMs", "cooldownAuthMs",
+		"cooldownTransientMs", "healthyTtlMs", "maxIdleResumes", "cooldownModelFaultMs",
+		"minContextWindow"]) num(k);
+	for (const k of ["continuationText"]) str(k);
+	for (const k of ["fallbackChain", "ignoreCodes"]) strArray(k);
+	return out;
+}
+
 export async function apply(ctx, rawConfig) {
-	const config = { ...DEFAULTS, ...(rawConfig ?? {}) };
+	const config = normalizeConfig(rawConfig);
 	const lifetime = new AbortController();
 	/** route key -> { until, code } — recently failed routes are skipped as fallbacks. */
 	const cooldown = new Map();
@@ -233,8 +258,9 @@ export async function apply(ctx, rawConfig) {
 		};
 		for (const raw of config.fallbackChain ?? []) {
 			const cut = raw.indexOf("/");
-			if (cut <= 0) continue;
-			push(raw.slice(0, cut), raw.slice(cut + 1));
+			const model = cut > 0 ? raw.slice(cut + 1) : "";
+			if (cut <= 0 || model === "") continue; // skip "garbage", "/leading", "trailing/"
+			push(raw.slice(0, cut), model);
 		}
 		try {
 			for (const provider of ctx.llm.listProviders()) {
@@ -355,7 +381,7 @@ export async function apply(ctx, rawConfig) {
 		let probed = 0;
 		for (const candidate of pool) {
 			if (probed >= config.maxProbeCandidates) break;
-			if (signal.aborted || lifetime.signal.aborted) return next();
+			if (signal?.aborted || lifetime.signal.aborted) return next();
 			probed += 1;
 			const cached = healthy.get(routeKey(candidate.provider, candidate.model));
 			if (cached !== undefined && cached.until > Date.now()) {
@@ -367,7 +393,7 @@ export async function apply(ctx, rawConfig) {
 				break;
 			}
 			const verdict = await probeRoute(candidate, signal);
-			if (signal.aborted || lifetime.signal.aborted) return next();
+			if (signal?.aborted || lifetime.signal.aborted) return next();
 			if (verdict.ok) {
 				healthy.set(routeKey(candidate.provider, candidate.model), { until: Date.now() + config.healthyTtlMs });
 				chosen = candidate;
@@ -415,12 +441,23 @@ export async function apply(ctx, rawConfig) {
 	 * continue (the model itself was never the problem).
 	 */
 	async function resumeIdle(agent, pending) {
-		if (typeof agent.model?.select !== "function" || typeof agent.followup !== "function") return;
+		// Hard cap, checked here (not only in the status listener) so a re-armed
+		// pending record from a later agent/error cannot bypass the budget.
+		const used = idleResumes.get(agent.id) ?? 0;
+		if (used >= config.maxIdleResumes) {
+			ctx.logger.warn(`auto-continue: session "${agent.id}" already idle-resumed ${used} times this lifetime; giving up`);
+			pendingResume.delete(agent.id);
+			return;
+		}
+		if (typeof agent.model?.select !== "function" || typeof agent.followup !== "function") {
+			pendingResume.delete(agent.id);
+			return;
+		}
 		if (pending.code === "DRIVER_ERROR") {
 			agent.followup(anyUserMessage(config.continuationText));
-			const used = idleResumes.get(agent.id) ?? 0;
 			idleResumes.set(agent.id, used + 1);
 			ctx.logger.info(`auto-continue: idle resume after driver error (${pending.message}); queued continuation`);
+			pendingResume.delete(agent.id);
 			return;
 		}
 		const current = agent.model.current();
@@ -429,9 +466,9 @@ export async function apply(ctx, rawConfig) {
 		const currentWindow = await currentModelWindow(current?.provider, current?.model);
 		const pool = await listCandidates(current?.provider, current?.model, pending.code, currentWindow);
 		for (const candidate of pool) {
-			if (lifetime.signal.aborted) return;
+			if (lifetime.signal.aborted) { pendingResume.delete(agent.id); return; }
 			const verdict = await probeRoute(candidate, undefined);
-			if (lifetime.signal.aborted) return;
+			if (lifetime.signal.aborted) { pendingResume.delete(agent.id); return; }
 			if (verdict.ok) {
 				healthy.set(routeKey(candidate.provider, candidate.model), { until: Date.now() + config.healthyTtlMs });
 				if (current?.provider && current?.model) {
@@ -439,9 +476,9 @@ export async function apply(ctx, rawConfig) {
 					recordSwitch(agent, { source: "idle-resume", from: { provider: current.provider, model: current.model }, to: { provider: candidate.provider, model: candidate.model }, failure: { code: pending.code, message: pending.message } });
 				}
 				agent.followup(anyUserMessage(config.continuationText));
-				const used = idleResumes.get(agent.id) ?? 0;
 				idleResumes.set(agent.id, used + 1);
 				ctx.logger.info(`auto-continue: idle resume switched to "${candidate.provider}/${candidate.model}" (was ${pending.code})`);
+				pendingResume.delete(agent.id);
 				return;
 			}
 			// MODEL_SWITCH_COMPACTION_FAILED is a destination-window problem, not
@@ -454,10 +491,10 @@ export async function apply(ctx, rawConfig) {
 		// No healthy destination right now. Still queue ONE continuation so the
 		// loop retries on the current model (which may have recovered by then)
 		// instead of freezing the session. maxIdleResumes bounds this loop.
-		const used = idleResumes.get(agent.id) ?? 0;
 		idleResumes.set(agent.id, used + 1);
 		agent.followup(anyUserMessage(config.continuationText));
 		ctx.logger.warn(`auto-continue: idle resume found no healthy model (${pending.code}); queued continuation on current model (attempt ${used + 1}/${config.maxIdleResumes})`);
+		pendingResume.delete(agent.id);
 	}
 
 	const disposeRequestError = ctx.on("agent/request-error", (payload, next) => recover(payload, next));
