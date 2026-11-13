@@ -23,7 +23,36 @@ window.__ModuleLoader__.load({
 
 		const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 		const opt = (label, value, recommended) => ({ label, value, ...(recommended ? { recommended: true } : {}) });
-		const CUSTOM = () => ({ label: "自定义…", custom: true });
+		const CUSTOM = () => ({ label: "自定义（从模型列表选）…", custom: true });
+
+		/**
+		 * Known model routes of this deployment (provider -> model ids).
+		 * Used to populate the fallback-chain picker so a person chooses from
+		 * the current catalog instead of typing `provider/model` by hand.
+		 * A Host-provided `modelOptions` config field (if present) is merged on
+		 * top and wins, so this snapshot only matters when no live list exists.
+		 */
+		const KNOWN_MODELS = {
+			"workbuddy-vision": ["hy4free", "hy4std", "hy3", "hy3-x", "glm-5.3", "glm-5.3-flash", "glm-5.2", "deepseek-v4.1-flash", "deepseek-v4-pro", "minimax-m3.1-flash", "kimi-k3.1-pro", "kimi-k3-1", "kimi-k2.8-preview", "step-5-preview", "mimo-v2.6-pro", "space-bunny"],
+			raccoon: ["sn-deepseek-v4-1-flash-1017"],
+			"trae-vision": ["glm-5.3", "deepseek-v4.1-flash"],
+			"our-free-model-vision": ["minimaxai/minimax-m3.1-flash"],
+			"kilo-auto": ["free"],
+			"deepseek-account": ["deepseek-v4-pro"]
+		};
+		const modelChoices = (extra) => {
+			const all = [];
+			const push = (route) => {
+				const s = String(route ?? "").trim();
+				if (s === "" || all.includes(s)) return;
+				all.push(s);
+			};
+			for (const [provider, models] of Object.entries(KNOWN_MODELS)) {
+				for (const model of models) push(`${provider}/${model}`);
+			}
+			for (const route of Array.isArray(extra) ? extra : []) push(route);
+			return all;
+		};
 
 		// Text <-> array codecs for the two custom-capable fields.
 		const toText = (key, v) => key === "ignoreCodes"
@@ -50,7 +79,7 @@ window.__ModuleLoader__.load({
 				options: [opt("继续（推荐）", "继续", true), opt("继续完成上面的任务", "继续完成上面的任务"), opt("请从中断处继续", "请从中断处继续")]
 			},
 			{
-				key: "fallbackChain", label: "优先切换模型链", hint: "按顺序尝试；选「自定义」可按 provider/model 一行一个填写", group: "basic", custom: true,
+				key: "fallbackChain", label: "优先切换模型链", hint: "按顺序尝试；选「自定义」后可从当前模型列表下拉逐个加入（也可手填 provider/model）", group: "basic", custom: true,
 				options: [
 					opt("自动枚举全部可用模型（推荐）", [], true),
 					opt("优先 DeepSeek 官方模型", ["deepseek-account/deepseek-v4-pro"]),
@@ -145,7 +174,7 @@ window.__ModuleLoader__.load({
 		const rowStyle = { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 10 };
 		const labelStyle = { flex: "0 0 210px", fontSize: 13, lineHeight: "26px", opacity: 0.9 };
 
-		function FieldRow({ field, value, isCustom, onSelect, onCustomText, disabled }) {
+		function FieldRow({ field, value, isCustom, onSelect, onCustomText, onPickModel, onRemoveChain, modelChoices: choices, disabled }) {
 			const idx = isCustom
 				? customIndex(field)
 				: (() => { const i = indexOfValue(field, value); return i >= 0 ? i : (field.custom ? customIndex(field) : 0); })();
@@ -159,14 +188,52 @@ window.__ModuleLoader__.load({
 				}
 			}, field.options.map((o, i) => h("option", { key: i, value: String(i) }, o.label + (o.recommended ? " ★推荐" : ""))));
 			const showCustom = field.custom && (isCustom || idx === customIndex(field));
-			const extra = showCustom
-				? h("textarea", {
-					value: toText(field.key, value), rows: field.key === "fallbackChain" ? 4 : 2, disabled,
-					placeholder: field.key === "fallbackChain" ? "例如：\ndoubao/9\nraccoon/sn-sensenova-6-8-flash" : "ABORTED, IMAGE_OFFLOAD_REQUIRED",
+			let extra = null;
+			if (showCustom && field.key === "fallbackChain") {
+				// Model picker: choose from the current catalog instead of typing.
+				const chain = Array.isArray(value) ? value : [];
+				const available = (choices || []).filter((route) => !chain.includes(route));
+				extra = h("div", null,
+					h("div", { style: { display: "flex", gap: 6, marginTop: 6 } },
+						h("select", {
+							value: "", disabled: disabled || available.length === 0, style: { ...selectStyle, flex: 1 },
+							onChange: (e) => {
+								const picked = e.target.value;
+								if (picked) onPickModel(field, picked);
+								e.target.value = "";
+							}
+						},
+						[
+							h("option", { key: "__placeholder", value: "" }, available.length ? "从当前模型列表选择…" : "（当前列表已全部加入）"),
+							...available.map((route, i) => h("option", { key: route + i, value: route }, route))
+						]),
+						h("button", {
+							type: "button", disabled: disabled || chain.length === 0,
+							onClick: () => onCustomText(field, ""), title: "清空模型链"
+						}, "清空")),
+					chain.length > 0
+						? h("ol", { style: { margin: "6px 0 0 18px", padding: 0, fontSize: 12 } },
+							chain.map((route, i) => h("li", { key: route + i, style: { marginBottom: 2 } },
+								h("span", { style: { fontFamily: "var(--dsh-font-mono, monospace)" } }, route),
+								h("button", {
+									type: "button", disabled, style: { marginLeft: 8, fontSize: 11 },
+									onClick: () => onRemoveChain(field, i)
+								}, "移除"))))
+						: h("div", { style: { fontSize: 11, opacity: 0.55, marginTop: 6 } }, "还没有加入模型；可从上方下拉列表逐个添加。"),
+					h("textarea", {
+						value: toText(field.key, value), rows: 3, disabled,
+						placeholder: "也可直接手填，一行一个：\nworkbuddy-vision/glm-5.3\nraccoon/sn-deepseek-v4-1-flash-1017",
+						style: areaStyle,
+						onChange: (e) => onCustomText(field, e.target.value)
+					}));
+			} else if (showCustom) {
+				extra = h("textarea", {
+					value: toText(field.key, value), rows: 2, disabled,
+					placeholder: "ABORTED, IMAGE_OFFLOAD_REQUIRED",
 					style: areaStyle,
 					onChange: (e) => onCustomText(field, e.target.value)
-				})
-				: null;
+				});
+			}
 			return h("div", { style: rowStyle },
 				h("label", { style: labelStyle }, field.label),
 				h("div", { style: { flex: 1, minWidth: 0 } }, selector, extra,
@@ -193,6 +260,9 @@ window.__ModuleLoader__.load({
 			const [error, setError] = React.useState(null);
 			const [saving, setSaving] = React.useState(false);
 			const draft = state.d, custom = state.c;
+			// Live model routes if the Host ever publishes them; the baked
+			// catalog covers deployments that do not.
+			const choices = React.useMemo(() => modelChoices(accepted.modelOptions), [accepted.modelOptions]);
 
 			const setVal = (key, val, isCustom) => {
 				setState((s) => ({ d: { ...s.d, [key]: val }, c: { ...s.c, [key]: !!isCustom } }));
@@ -222,8 +292,18 @@ window.__ModuleLoader__.load({
 						FIELDS.filter((f) => f.group === group).map((f) =>
 							h(FieldRow, {
 								key: f.key, field: f, value: draft[f.key], isCustom: !!custom[f.key], disabled: !writable,
+								modelChoices: choices,
 								onSelect: (field, isCustom, val) => setVal(field.key, val, isCustom),
-								onCustomText: (field, text) => setVal(field.key, fromText(field.key, text), true)
+								onCustomText: (field, text) => setVal(field.key, fromText(field.key, text), true),
+								onPickModel: (field, route) => {
+									const cur = Array.isArray(draft[field.key]) ? draft[field.key] : [];
+									if (cur.includes(route)) return;
+									setVal(field.key, [...cur, route], true);
+								},
+								onRemoveChain: (field, index) => {
+									const cur = Array.isArray(draft[field.key]) ? draft[field.key] : [];
+									setVal(field.key, cur.filter((_, i) => i !== index), true);
+								}
 							})))),
 				h("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 16, flexWrap: "wrap" } },
 					h("button", { type: "button", disabled: !dirty || saving || !writable, onClick: save }, saving ? "保存中…" : "保存"),
