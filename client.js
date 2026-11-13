@@ -1,12 +1,14 @@
 /**
  * dsh-auto-continue — browser half: the bundle's settings panel.
  *
- * Registers into the Plugins page's `plugins.bundle.config` slot (keyed by our
- * package name), binding the Host-side Config namespace through
- * `ctx.configForms.get("auto-continue")`. Saving writes all fields with the
- * revision read before editing, so a concurrent edit elsewhere is refused
- * instead of silently overwritten. Only a save writes; leaving the page drops
- * the staged draft.
+ * Registers into BOTH plugin-detail slots the Plugins page declares:
+ *   - `plugins.bundle.config` (key = bundle package name) — bundle detail page
+ *   - `plugins.row.config`    (key = `<pkg>#<row id>`)     — row Configure page
+ * The Host Config namespace is read through the optional `configForms` service.
+ * We deliberately do NOT list `configForms` in `inject`: it is not a baseline
+ * Client service key, so injecting it leaves the plugin pending forever and no
+ * slot ever registers (the exact bug of v1.2.0). Only `slots` + `locale` are
+ * baseline; everything else is obtained with ctx.get() and degrades gracefully.
  */
 window.__ModuleLoader__.load({
 	id: "dsh-auto-continue",
@@ -14,7 +16,6 @@ window.__ModuleLoader__.load({
 		const React = require("react");
 		const h = React.createElement;
 
-		/** Field layout: [key, type, label, hint, group] */
 		const FIELDS = [
 			["enabled", "bool", "总开关", "关闭后不介入任何失败", "basic"],
 			["continuationText", "text", "续接消息文本", "切换模型后自动补发的消息", "basic"],
@@ -37,19 +38,12 @@ window.__ModuleLoader__.load({
 			["cooldownModelFaultMs", "number", "模型故障冷却（毫秒）", "", "advanced"],
 			["healthyTtlMs", "number", "健康缓存时长（毫秒）", "", "advanced"]
 		];
-
-		const GROUPS = [
-			["basic", "基础"],
-			["behavior", "切换行为"],
-			["advanced", "高级（探测与冷却）"]
-		];
+		const GROUPS = [["basic", "基础"], ["behavior", "切换行为"], ["advanced", "高级（探测与冷却）"]];
+		const mono = { fontFamily: "var(--dsh-font-mono, monospace)", fontSize: 12 };
 
 		const section = (title, children) =>
 			h("section", { key: title, style: { margin: "16px 0" } },
-				h("h3", { style: { fontSize: 13, margin: "0 0 8px", opacity: 0.85 } }, title),
-				children);
-
-		const mono = { fontFamily: "var(--dsh-font-mono, monospace)", fontSize: 12 };
+				h("h3", { style: { fontSize: 13, margin: "0 0 8px", opacity: 0.85 } }, title), children);
 
 		function FieldRow({ field, draft, setDraft, disabled }) {
 			const [key, type, label, hint] = field;
@@ -57,17 +51,12 @@ window.__ModuleLoader__.load({
 			let control;
 			if (type === "bool") {
 				control = h("input", { type: "checkbox", checked: value === true, disabled, onChange: (e) => setDraft(key, e.target.checked) });
-			} else if (type === "models") {
+			} else if (type === "models" || type === "codes") {
+				const joined = type === "models" ? "\n" : ", ";
 				control = h("textarea", {
-					value: Array.isArray(value) ? value.join("\n") : String(value ?? ""),
-					disabled, rows: 4, placeholder: "例如：\ndoubao/9\nraccoon/sn-sensenova-6-8-flash",
-					style: { width: "100%", ...mono, resize: "vertical", boxSizing: "border-box" },
-					onChange: (e) => setDraft(key, e.target.value)
-				});
-			} else if (type === "codes") {
-				control = h("textarea", {
-					value: Array.isArray(value) ? value.join(", ") : String(value ?? ""),
-					disabled, rows: 2, placeholder: "ABORTED, IMAGE_OFFLOAD_REQUIRED",
+					value: Array.isArray(value) ? value.join(joined) : String(value ?? ""),
+					disabled, rows: type === "models" ? 4 : 2,
+					placeholder: type === "models" ? "例如：\ndoubao/9\nraccoon/sn-sensenova-6-8-flash" : "ABORTED, IMAGE_OFFLOAD_REQUIRED",
 					style: { width: "100%", ...mono, resize: "vertical", boxSizing: "border-box" },
 					onChange: (e) => setDraft(key, e.target.value)
 				});
@@ -82,20 +71,18 @@ window.__ModuleLoader__.load({
 			}
 			return h("div", { key, style: { display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 10 } },
 				h("label", { style: { flex: "0 0 210px", fontSize: 13, lineHeight: "24px", opacity: 0.9 } }, label),
-				h("div", { style: { flex: 1, minWidth: 0 } },
-					control,
+				h("div", { style: { flex: 1, minWidth: 0 } }, control,
 					hint ? h("div", { style: { fontSize: 11, opacity: 0.55, marginTop: 2 } }, hint) : null));
 		}
 
-		function norm(v, type) {
+		const norm = (v, type) => {
 			if (type === "models") return Array.isArray(v) ? v.join("\n") : String(v ?? "");
 			if (type === "codes") return Array.isArray(v) ? v.join(", ") : String(v ?? "");
 			if (type === "number") return Number(v);
 			if (type === "bool") return Boolean(v);
 			return String(v ?? "");
-		}
-
-		const coerce = (key, type, value) => {
+		};
+		const coerce = (type, value) => {
 			if (type === "models") return String(value ?? "").split("\n").map((l) => l.trim()).filter(Boolean);
 			if (type === "codes") return String(value ?? "").split(/[,，\n]/).map((s) => s.trim()).filter(Boolean);
 			if (type === "number") { const n = Number(value); return Number.isFinite(n) ? n : 0; }
@@ -103,54 +90,42 @@ window.__ModuleLoader__.load({
 			return String(value ?? "");
 		};
 
-		function AutoContinueSettings({ hooks }) {
-			const scope = hooks.scope;
-			const [version, setVersion] = React.useState(0);
-			React.useEffect(() => scope.subscribe(() => setVersion((n) => n + 1)), [scope]);
+		function AutoContinueSettings({ scope }) {
+			const [, setVersion] = React.useState(0);
+			React.useEffect(() => {
+				if (!scope || typeof scope.subscribe !== "function") return undefined;
+				return scope.subscribe(() => setVersion((n) => n + 1));
+			}, [scope]);
 
-			const snap = scope.getSnapshot();
-			const accepted = snap?.value ?? {};
-			const writable = snap?.writable !== false;
-			const revision = snap?.revision ?? 0;
+			const snap = scope && typeof scope.getSnapshot === "function" ? scope.getSnapshot() : undefined;
+			if (!snap) {
+				return h("div", { "data-plugin-config": true, style: { fontSize: 13, opacity: 0.7 } },
+					"配置服务暂不可用；请确认 Host 侧 auto-continue 行已启用，或重启 DSH。");
+			}
+			const accepted = snap.value ?? {};
+			const writable = snap.writable !== false;
+			const revision = snap.revision ?? 0;
 
-			// Stage a draft from the accepted value. A key-ed remount on revision
-			// clears local edits whenever the stored config changes elsewhere.
 			const [draft, setDraftState] = React.useState(() => ({ ...accepted }));
 			const [stagedRev, setStagedRev] = React.useState(revision);
-			if (stagedRev !== revision) {
-				setStagedRev(revision);
-				setDraftState({ ...accepted });
-			}
+			if (stagedRev !== revision) { setStagedRev(revision); setDraftState({ ...accepted }); }
 			const [savedAt, setSavedAt] = React.useState(null);
 			const [error, setError] = React.useState(null);
 			const [saving, setSaving] = React.useState(false);
 
-			if (!snap) return h("div", null, "…");
-
-			const setDraft = (key, value) => {
-				setDraftState((prev) => ({ ...prev, [key]: value }));
-				setError(null);
-			};
-
+			const setDraft = (key, value) => { setDraftState((prev) => ({ ...prev, [key]: value })); setError(null); };
 			const dirty = FIELDS.some(([key, type]) => norm(draft[key], type) !== norm(accepted[key], type));
-			const coerceAll = () => FIELDS.map(([key, type]) => ({ op: "set", path: [key], value: coerce(key, type, draft[key]) }));
 
 			const save = async () => {
-				if (!dirty || saving) return;
-				setSaving(true);
-				setError(null);
+				if (!dirty || saving || typeof scope.mutate !== "function") return;
+				setSaving(true); setError(null);
 				try {
-					const result = await scope.mutate(coerceAll(), revision);
-					if (result?.ok === false) {
-						setError(`保存被拒绝：${result.error?.message ?? "revision 冲突，请刷新后重试"}`);
-					} else {
-						setSavedAt(Date.now());
-					}
-				} catch (e) {
-					setError(`保存失败：${e?.message ?? String(e)}`);
-				} finally {
-					setSaving(false);
-				}
+					const ops = FIELDS.map(([key, type]) => ({ op: "set", path: [key], value: coerce(type, draft[key]) }));
+					const result = await scope.mutate(ops, revision);
+					if (result && result.ok === false) setError(`保存被拒绝：${result.error?.message ?? "revision 冲突，请重试"}`);
+					else setSavedAt(Date.now());
+				} catch (e) { setError(`保存失败：${e?.message ?? String(e)}`); }
+				finally { setSaving(false); }
 			};
 
 			return h("div", { "data-plugin-config": true, style: { fontSize: 13 } },
@@ -167,14 +142,29 @@ window.__ModuleLoader__.load({
 		}
 
 		return {
-			inject: ["slots", "configForms"],
+			// Baseline Client service keys only. Adding a non-baseline key here
+			// leaves the plugin pending forever and no slot ever registers.
+			inject: ["slots", "locale"],
 			apply(ctx) {
-				const scope = ctx.configForms.get("auto-continue");
-				ctx.slots.inject("plugins.bundle.config", () => ctx.slots.register({
-					name: "plugins.bundle.config",
-					key: "dsh-auto-continue",
-					inject: () => ({ hooks: { scope } })
-				}, AutoContinueSettings));
+				const forms = ctx.get ? ctx.get("configForms") : undefined;
+				const scope = forms && typeof forms.get === "function" ? forms.get("auto-continue") : undefined;
+				const render = () => h(AutoContinueSettings, { scope });
+				const safe = (tag, fn) => {
+					try { fn(); } catch (e) {
+						if (ctx.logger && ctx.logger.warn) ctx.logger.warn(`auto-continue: ${tag} failed: ${e && e.message ? e.message : String(e)}`);
+					}
+				};
+				// Bundle detail page (main entry the user asked for).
+				safe("plugins.bundle.config", () =>
+					ctx.slots.inject("plugins.bundle.config", () =>
+						ctx.slots.register({ name: "plugins.bundle.config", key: "dsh-auto-continue" }, render)));
+				// Row Configure page (second entry; shows a summary on the card).
+				safe("plugins.row.config", () =>
+					ctx.slots.inject("plugins.row.config", () =>
+						ctx.slots.register({ name: "plugins.row.config", key: "dsh-auto-continue#auto-continue" },
+							(slotProps) => slotProps && slotProps.view === "summary"
+								? h("span", null, "自动续接与模型切换 · 可配置优先模型链、探测与冷却")
+								: render())));
 			}
 		};
 	}

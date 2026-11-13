@@ -1,7 +1,7 @@
 {
     "name":  "dsh-auto-continue",
     "description":  "Auto-continue interrupted sessions: probe an available fallback model, switch durably, and resume",
-    "version":  "1.2.0",
+    "version":  "1.2.1",
     "private":  true,
     "type":  "module",
     "exports":  {
@@ -25,12 +25,7 @@
                                "patch":  "./cordis.patch.yml"
                            },
                 "client":  {
-                               "platform":  "web",
-                               "immediately":  true,
-                               "inject":  [
-                                              "@deepseek-ai/dsh-client-ui-settings",
-                                              "@deepseek-ai/dsh-client-ui-plugin-manager"
-                                          ]
+                               "platform":  "web"
                            }
             },
     "dependencies":  {
