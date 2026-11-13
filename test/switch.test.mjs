@@ -3,11 +3,11 @@
  * Mocks the llm registry + agent surface, drives the real plugin code
  * through a request-error, and asserts the full switch chain.
  */
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import path from "node:path";
 import assert from "node:assert";
 
-const BUNDLE = path.join(__dirname, "..");
+const BUNDLE = path.dirname(fileURLToPath(import.meta.url)) + "/..";
 
 /** Build a fake provider catalog. raccoon-vision is storming (429), others healthy. */
 function makeLlm({ stormRaccoon = true } = {}) {
