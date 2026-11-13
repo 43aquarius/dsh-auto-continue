@@ -1,5 +1,5 @@
 /**
- * dsh-auto-continue — auto-continue interrupted sessions by switching models.
+ * @local/auto-continue — auto-continue interrupted sessions by switching models.
  *
  * Hooks the agent loop's `agent/request-error` waterfall. When a request fails
  * with a switchable failure (quota exhausted, rate limit, reset windows,
@@ -43,11 +43,13 @@ const DEFAULTS = {
 	continuationText: "继续",
 	fallbackChain: [],
 	ignoreCodes: ["ABORTED", "IMAGE_OFFLOAD_REQUIRED"],
-	maxSwitchesPerTurn: 3,
+	// 0 means "no cap": try every candidate model. A single turn's pool is
+	// finite (all registered routes), so unbounded per-turn is still safe.
+	maxSwitchesPerTurn: 0,
 	probe: true,
 	probeTimeoutMs: 20000,
 	probeMaxTokens: 16,
-	maxProbeCandidates: 6,
+	maxProbeCandidates: 0,
 	switchAfterMs: 120000,
 	cooldownQuotaMs: 1800000,
 	cooldownRateLimitMs: 300000,
@@ -55,7 +57,9 @@ const DEFAULTS = {
 	cooldownTransientMs: 120000,
 	healthyTtlMs: 600000,
 	resumeOnErrorIdle: true,
-	maxIdleResumes: 3,
+	// 0 = unlimited idle resumes, but a hard ceiling still bounds the loop so a
+	// permanently-dead model can never spin forever (see IDLE_RESUME_HARD_CAP).
+	maxIdleResumes: 0,
 	cooldownModelFaultMs: 1800000,
 	preferLargeContext: true,
 	minContextWindow: 0
@@ -152,10 +156,6 @@ if (z) {
 		cooldownModelFaultMs: z.number().default(DEFAULTS.cooldownModelFaultMs).description("模型级持续故障（PI_AI_ERROR/MODEL_SWITCH_COMPACTION_FAILED 等）的冷却时间（毫秒）"),
 		preferLargeContext: z.boolean().default(DEFAULTS.preferLargeContext).description("切换时优先选择上下文窗口足够大的模型，避免切过去触发历史压缩（压缩摘要仍用旧模型，旧模型限流时会失败）"),
 		minContextWindow: z.number().default(DEFAULTS.minContextWindow).description("候选模型的最小上下文窗口（token，0=不限制）；低于此值的模型不作为切换目标"),
-		// Volatile: refreshed by the Host at startup so the settings panel can
-		// offer the live model catalog in its dropdown. Updates in place, never
-		// restarts the plugin, never pollutes the persisted YAML.
-		modelOptions: z.array(z.string()).default([]).volatile().description("当前已注册的模型路由（provider/model）；由插件启动时自动刷新，供设置面板下拉选择")
 	});
 }
 
@@ -227,40 +227,11 @@ export async function apply(ctx, rawConfig) {
 	const routeKey = (provider, model) => `${provider}/${model}`;
 
 	/**
-	 * Publish the live model catalog into the volatile `modelOptions` config
-	 * field so the settings panel's dropdown can offer every currently
-	 * registered route. Volatile fields update in place (no plugin restart)
-	 * and never persist to the profile YAML.
+	 * Even when `maxIdleResumes` is 0 (unlimited), the idle-resume loop iterates
+	 * the finite candidate pool, so it cannot spin forever. This hard ceiling is
+	 * a belt-and-suspenders guard against a permanently-dead model eating CPU.
 	 */
-	async function refreshModelOptions() {
-		try {
-			const llm = typeof ctx.get === "function" ? ctx.get("llm") : ctx.llm;
-			if (!llm || typeof llm.listProviders !== "function" || typeof llm.listModels !== "function") return;
-			const routes = [];
-			for (const provider of llm.listProviders()) {
-				let models;
-				try { models = await llm.listModels(provider.id); } catch { continue; }
-				for (const model of Array.isArray(models) ? models : []) {
-					if (model?.id) routes.push(`${provider.id}/${model.id}`);
-				}
-			}
-			if (routes.length === 0) return;
-			const entry = ctx.fiber?.entry;
-			const editor = typeof ctx.get === "function" ? ctx.get("configEditor") : undefined;
-			if (!entry || !editor || typeof editor.edit !== "function") {
-				ctx.logger.warn("auto-continue: configEditor unavailable; settings panel will use the baked model list");
-				return;
-			}
-			await editor.edit(entry, (current) => {
-				const prev = current?.modelOptions;
-				if (Array.isArray(prev) && prev.length === routes.length && prev.every((route, i) => route === routes[i])) return current;
-				return { ...current, modelOptions: routes };
-			});
-			ctx.logger.info(`auto-continue: model catalog refreshed (${routes.length} routes) for the settings panel`);
-		} catch (error) {
-			ctx.logger.warn(`auto-continue: model catalog refresh skipped (${error instanceof Error ? error.message : String(error)})`);
-		}
-	}
+	const IDLE_RESUME_HARD_CAP = 20;
 
 
 	function cooldownMsFor(code, providerRetryAfterMs) {
@@ -408,7 +379,7 @@ export async function apply(ctx, rawConfig) {
 		const turns = switches.get(agent.id) ?? new Map();
 		switches.set(agent.id, turns);
 		const used = turns.get(turn) ?? 0;
-		if (used >= config.maxSwitchesPerTurn) {
+		if (config.maxSwitchesPerTurn > 0 && used >= config.maxSwitchesPerTurn) {
 			ctx.logger.warn(`auto-continue: session "${agent.id}" turn ${turn} already switched ${used} times; surfacing the error`);
 			return next();
 		}
@@ -421,7 +392,7 @@ export async function apply(ctx, rawConfig) {
 		let chosen;
 		let probed = 0;
 		for (const candidate of pool) {
-			if (probed >= config.maxProbeCandidates) break;
+			if (config.maxProbeCandidates > 0 && probed >= config.maxProbeCandidates) break;
 			if (signal?.aborted || lifetime.signal.aborted) return next();
 			probed += 1;
 			const cached = healthy.get(routeKey(candidate.provider, candidate.model));
@@ -485,8 +456,10 @@ export async function apply(ctx, rawConfig) {
 		// Hard cap, checked here (not only in the status listener) so a re-armed
 		// pending record from a later agent/error cannot bypass the budget.
 		const used = idleResumes.get(agent.id) ?? 0;
-		if (used >= config.maxIdleResumes) {
-			ctx.logger.warn(`auto-continue: session "${agent.id}" already idle-resumed ${used} times this lifetime; giving up`);
+		// Soft budget: 0 = unlimited. Hard ceiling: never spin forever on a dead model.
+		const cap = config.maxIdleResumes > 0 ? config.maxIdleResumes : IDLE_RESUME_HARD_CAP;
+		if (used >= cap) {
+			ctx.logger.warn(`auto-continue: session "${agent.id}" idle-resumed ${used} times this lifetime (cap ${cap}); giving up`);
 			pendingResume.delete(agent.id);
 			return;
 		}
@@ -534,7 +507,7 @@ export async function apply(ctx, rawConfig) {
 		// instead of freezing the session. maxIdleResumes bounds this loop.
 		idleResumes.set(agent.id, used + 1);
 		agent.followup(anyUserMessage(config.continuationText));
-		ctx.logger.warn(`auto-continue: idle resume found no healthy model (${pending.code}); queued continuation on current model (attempt ${used + 1}/${config.maxIdleResumes})`);
+		ctx.logger.warn(`auto-continue: idle resume found no healthy model (${pending.code}); queued continuation on current model (attempt ${used + 1})`);
 		pendingResume.delete(agent.id);
 	}
 
@@ -575,8 +548,9 @@ export async function apply(ctx, rawConfig) {
 		const pending = pendingResume.get(agent.id);
 		if (!pending) return typeof next === "function" ? next() : undefined;
 		const used = idleResumes.get(agent.id) ?? 0;
-		if (used >= config.maxIdleResumes) {
-			ctx.logger.warn(`auto-continue: session "${agent.id}" already idle-resumed ${used} times this lifetime; giving up`);
+		const cap = config.maxIdleResumes > 0 ? config.maxIdleResumes : IDLE_RESUME_HARD_CAP;
+		if (used >= cap) {
+			ctx.logger.warn(`auto-continue: session "${agent.id}" idle-resumed ${used} times this lifetime (cap ${cap}); giving up`);
 			pendingResume.delete(agent.id);
 			return typeof next === "function" ? next() : undefined;
 		}
@@ -599,9 +573,6 @@ export async function apply(ctx, rawConfig) {
 		disposeDisposed();
 		lifetime.abort(new Error("auto-continue plugin disposed"));
 	}, "auto-continue: dispose listeners");
-
-	// Fire-and-forget: publish the live model catalog for the settings panel.
-	void refreshModelOptions();
 }
 
 export { Config, inject, name };

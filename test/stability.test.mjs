@@ -1,5 +1,5 @@
 /**
- * Stability / edge-case suite for dsh-auto-continue.
+ * Stability / edge-case suite for @local/auto-continue.
  * Complements switch.test.mjs (happy paths) with defensive checks:
  * missing fields, hostile config, disposal, repeated failures, log hygiene.
  */
@@ -156,6 +156,33 @@ async function run() {
 		await call("agent/request-error", basePayload({ agent, turn: 1 }), () => "OK");
 		await call("agent/request-error", basePayload({ agent, turn: 2 }), () => "OK");
 		assert.strictEqual(record.selects.length, 2);
+		await cleanup();
+	});
+
+	// --- T6b: default maxSwitchesPerTurn=0 means UNLIMITED (honor all chains)
+	await test("T6b default maxSwitchesPerTurn=0 does not cap switching", async () => {
+		// 0 is the shipped default; a user with many models must be able to try them all.
+		const { call, cleanup } = await mount(mod, { maxSwitchesPerTurn: 0, probe: false });
+		const { agent, record } = makeAgent();
+		for (let i = 0; i < 8; i++) await call("agent/request-error", basePayload({ agent, turn: 7 }), () => "OK");
+		assert.strictEqual(record.selects.length, 8, "0 = unlimited, all 8 attempts switch");
+		assert.strictEqual(record.followups.length, 8);
+		await cleanup();
+	});
+
+	// --- T6c: default maxIdleResumes=0 is unlimited but bounded by the hard ceiling (anti-deadlock)
+	await test("T6c default maxIdleResumes=0 bounded by hard ceiling", async () => {
+		const { call, cleanup, warns } = await mount(mod, { maxIdleResumes: 0 }, makeLlm({ stormAll: true }));
+		const { agent } = makeAgent();
+		// Each request-error arms a pending resume; an idle status then resumes (async).
+		// Loop well beyond the hard ceiling (20) to prove the ceiling stops it.
+		for (let i = 0; i < 30; i++) {
+			await call("agent/request-error", basePayload({ agent, turn: i }), () => "OK");
+			await call("agent/status", { agent, status: "idle" }, () => undefined);
+			await new Promise((r) => setTimeout(r, 0)); // let resumeIdle's promise settle
+		}
+		const hardBounded = warns.some((w) => /idle-resumed \d+ times this lifetime \(cap 20\); giving up/.test(w));
+		assert.ok(hardBounded, "must hit the hard ceiling (cap 20) and give up, never spin forever");
 		await cleanup();
 	});
 

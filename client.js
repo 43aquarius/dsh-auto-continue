@@ -1,5 +1,5 @@
 /**
- * dsh-auto-continue — browser half: the bundle's settings panel.
+ * @local/auto-continue — browser half: the bundle's settings panel.
  *
  * Option-based form (v1.3.0): every setting is a <select> with a few curated
  * choices; the one marked ★推荐 is pre-selected. This replaces the free-text
@@ -16,7 +16,7 @@
  * baseline; everything else is obtained with ctx.get() and degrades gracefully.
  */
 window.__ModuleLoader__.load({
-	id: "dsh-auto-continue",
+	id: "@local/auto-continue",
 	factory: (require) => {
 		const React = require("react");
 		const h = React.createElement;
@@ -32,12 +32,36 @@ window.__ModuleLoader__.load({
 		 * A Host-provided `modelOptions` config field (if present) is merged on
 		 * top and wins, so this snapshot only matters when no live list exists.
 		 */
+		// Full baked catalog. The Host no longer pushes a live list (that path
+		// corrupted the persisted YAML and broke saving); we ship every known
+		// route here so the dropdown is always complete across restarts.
+		const FREE_MODELS = [
+			"big-pickle", "mimo-v2.6-flash-free", "deepseek-v4.1-flash-free",
+			"glm-5.3-flash-free", "longcat-2.5-free", "iceman-free",
+			"inkling-2-small-free", "beam-free", "flint-40b-free",
+			"nemotron-3.5-super-vl-free", "nemotron-3.5-lightning-free",
+			"minimax-m3.1-flash-free", "opencode/nemotron-3.5-lightning-free",
+			"opencode/flint-40b-free", "minimaxai/minimax-m3.1-flash",
+			"openai/gpt-oss-20b", "z-ai/glm-5.3-flash", "stepfun-ai/step-5-preview",
+			"deepseek-ai/deepseek-v4.1-flash", "opencode/glm-5.3-flash-free",
+			"moonshotai/kimi-k2.6", "opencode/nemotron-3.5-super-vl-free",
+			"opencode/deepseek-v4.1-flash-free", "kilo-auto/free",
+			"nvidia/nemotron-3.5-super-vl:free", "stealth/glyph-cluster",
+			"baidu/ernie-5.5-flash-preview:free", "liquid/lfm-3-1.7b:free",
+			"particle-ai/particle-1:free", "dots-studio/dots-3-note-preview:free",
+			"nvidia/nemotron-3.5-lightning:free", "cohere/north-mini-code:free",
+			"nvidia/nemotron-3-ultra-550b-a55b:free",
+			"nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+			"openrouter/free", "reflection/beam-free", "agnes/agnes-2.0-flash",
+			"combo:recommended-free"
+		];
 		const KNOWN_MODELS = {
 			"workbuddy-vision": ["hy4free", "hy4std", "hy3", "hy3-x", "glm-5.3", "glm-5.3-flash", "glm-5.2", "deepseek-v4.1-flash", "deepseek-v4-pro", "minimax-m3.1-flash", "kimi-k3.1-pro", "kimi-k3-1", "kimi-k2.8-preview", "step-5-preview", "mimo-v2.6-pro", "space-bunny"],
 			raccoon: ["sn-deepseek-v4-1-flash-1017"],
 			"trae-vision": ["glm-5.3", "deepseek-v4.1-flash"],
 			"vision-http": ["ovh/Qwen3.5-397B-A17B"],
-			"our-free-model-vision": ["minimaxai/minimax-m3.1-flash"],
+			"our-free-model": FREE_MODELS,
+			"our-free-model-vision": FREE_MODELS,
 			"kilo-auto": ["free"],
 			"deepseek-account": ["deepseek-v4-pro"]
 		};
@@ -103,12 +127,12 @@ window.__ModuleLoader__.load({
 				options: [opt("开启（推荐）", true, true), opt("关闭（直接切第一个候选）", false)]
 			},
 			{
-				key: "maxSwitchesPerTurn", label: "每回合最大切换数", hint: "防止同一回合内循环切换", group: "behavior",
-				options: [opt("1 次", 1), opt("2 次", 2), opt("3 次（推荐）", 3, true), opt("5 次", 5), opt("8 次", 8)]
+				key: "maxSwitchesPerTurn", label: "每回合最大切换数", hint: "同一回合内最多自动切换几次；0=不限制（推荐，会尝试全部候选模型）", group: "behavior",
+				options: [opt("不限制（推荐）", 0, true), opt("1 次", 1), opt("2 次", 2), opt("3 次", 3), opt("5 次", 5), opt("8 次", 8)]
 			},
 			{
-				key: "maxProbeCandidates", label: "最多探测候选数", hint: "单次故障最多探测多少个候选模型", group: "behavior",
-				options: [opt("3 个", 3), opt("4 个", 4), opt("6 个（推荐）", 6, true), opt("8 个", 8), opt("12 个", 12)]
+				key: "maxProbeCandidates", label: "最多探测候选数", hint: "单次故障最多探测多少个候选模型；0=不限制（推荐，会探测所有候选）", group: "behavior",
+				options: [opt("不限制（推荐）", 0, true), opt("3 个", 3), opt("4 个", 4), opt("6 个", 6), opt("8 个", 8), opt("12 个", 12)]
 			},
 			{
 				key: "switchAfterMs", label: "限流等待上限", hint: "上游提示的重置等待超过该值时不再等、直接切换", group: "behavior",
@@ -119,8 +143,8 @@ window.__ModuleLoader__.load({
 				options: [opt("开启（推荐）", true, true), opt("关闭（只在请求失败时介入）", false)]
 			},
 			{
-				key: "maxIdleResumes", label: "兜底续接上限", hint: "每会话每宿主生命周期内的最大兜底次数", group: "behavior",
-				options: [opt("1 次", 1), opt("2 次", 2), opt("3 次（推荐）", 3, true), opt("5 次", 5), opt("10 次", 10)]
+				key: "maxIdleResumes", label: "兜底续接上限", hint: "每会话每宿主生命周期内的最大兜底次数；0=不限制（推荐，但有内置安全上限防止死循环）", group: "behavior",
+				options: [opt("不限制（推荐）", 0, true), opt("1 次", 1), opt("2 次", 2), opt("3 次", 3), opt("5 次", 5), opt("10 次", 10)]
 			},
 			// ---- 高级 ----
 			{
@@ -173,7 +197,7 @@ window.__ModuleLoader__.load({
 		 * package name so the panel binds to whichever id this profile uses.
 		 * The first namespace whose snapshot reports `status === "ready"` wins.
 		 */
-		const SCOPE_CANDIDATES = ["auto-continue", "dsh-auto-continue", "dsh-auto-continue"];
+		const SCOPE_CANDIDATES = ["auto-continue", "@local/auto-continue", "dsh-auto-continue"];
 
 		function resolveScope(forms) {
 			if (!forms || typeof forms.get !== "function") return undefined;
@@ -389,11 +413,11 @@ window.__ModuleLoader__.load({
 				// Bundle detail page.
 				safe("plugins.bundle.config", () =>
 					ctx.slots.inject("plugins.bundle.config", () =>
-						ctx.slots.register({ name: "plugins.bundle.config", key: "dsh-auto-continue" }, render)));
+						ctx.slots.register({ name: "plugins.bundle.config", key: "@local/auto-continue" }, render)));
 				// Row Configure page (summary on the card, full form on the page).
 				safe("plugins.row.config", () =>
 					ctx.slots.inject("plugins.row.config", () =>
-						ctx.slots.register({ name: "plugins.row.config", key: "dsh-auto-continue#auto-continue" },
+						ctx.slots.register({ name: "plugins.row.config", key: "@local/auto-continue#auto-continue" },
 							(slotProps) => slotProps && slotProps.view === "summary"
 								? h("span", null, "自动续接与模型切换 · 可配置优先模型链、探测与冷却")
 								: render())));
