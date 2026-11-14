@@ -49,7 +49,7 @@ window.__ModuleLoader__.load({
 				]
 			},
 			{
-				key: "fallbackChain", label: "优先切换模型链", hint: "勾选即按顺序优先尝试；不勾选＝自动枚举全部可用模型", group: "basic",
+				key: "fallbackChain", label: "优先切换模型链", hint: "只在这条链内按顺序切换；全部不可用时直接报错，不会切到链外模型。不勾选＝自动枚举全部可用模型", group: "basic",
 				kind: "chain"
 			},
 			{

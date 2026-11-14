@@ -200,7 +200,13 @@ function normalizeConfig(raw) {
 }
 
 export async function apply(ctx, rawConfig) {
-	const config = normalizeConfig(rawConfig);
+	// LIVE, not a startup snapshot: the settings page writes through the Host
+	// `settings` service, and a save must take effect on the next failure without
+	// a restart. `syncConfig()` re-reads the descriptor below.
+	let config = normalizeConfig(rawConfig);
+	let configAt = 0;
+	let configSyncing = false;
+	let settingsRef;
 	const lifetime = new AbortController();
 	/** route key -> { until, code } — recently failed routes are skipped as fallbacks. */
 	const cooldown = new Map();
@@ -230,6 +236,36 @@ export async function apply(ctx, rawConfig) {
 			return;
 		}
 		ctx.logger.warn("auto-continue: appendPluginRecord unavailable in this host; switch record skipped");
+	}
+
+	/**
+	 * Re-read the live Config from the Host settings service. Cheap enough to run
+	 * on each failure (throttled), and the authoritative source once a user saves
+	 * from the settings page — `rawConfig` is only the value the Loader delivered
+	 * at load time.
+	 */
+	async function syncConfig(force = false) {
+		if (!settingsRef || typeof settingsRef.describe !== "function") return;
+		if (!force && Date.now() - configAt < 1500) return;
+		if (configSyncing) return;
+		configSyncing = true;
+		try {
+			const descriptors = settingsRef.describe({ redactSecrets: true }) ?? [];
+			const own = descriptors.find((entry) => String(entry?.ns) === SETTINGS_NS);
+			if (own && own.value && typeof own.value === "object") {
+				const next = normalizeConfig(own.value);
+				const chainChanged = JSON.stringify(next.fallbackChain) !== JSON.stringify(config.fallbackChain);
+				config = next;
+				configAt = Date.now();
+				if (chainChanged) {
+					ctx.logger.info(`auto-continue: live config reloaded (chain ${next.fallbackChain.length} entries)`);
+				}
+			}
+		} catch (error) {
+			ctx.logger.warn(`auto-continue: live config read failed (${error instanceof Error ? error.message : String(error)})`);
+		} finally {
+			configSyncing = false;
+		}
 	}
 
 	const routeKey = (provider, model) => `${provider}/${model}`;
@@ -329,10 +365,16 @@ export async function apply(ctx, rawConfig) {
 		if (!chainConfigured) pushRegistry();
 
 		let list = ordered.filter((candidate) => !(candidate.provider === excludeProvider && candidate.model === excludeModel));
+		// Hand-picked chain routes are exempt from the window heuristics below:
+		// the user picked them deliberately, so a small window must not silently
+		// delete one from its position.
+		const chainKeys = new Set(chainRoutes.map((raw) => routeKey(raw.provider, raw.model)));
+		const keepIfChain = (candidate) => chainKeys.has(routeKey(candidate.provider, candidate.model));
 		const minWindow = Math.max(0, Number(config.minContextWindow) || 0);
 		if (minWindow > 0) {
-			// An unknown window must not disqualify a configured chain entry.
-			list = list.filter((candidate) => candidate.contextWindow === undefined || (candidate.contextWindow ?? 0) >= minWindow);
+			list = list.filter((candidate) => keepIfChain(candidate)
+				|| candidate.contextWindow === undefined
+				|| (candidate.contextWindow ?? 0) >= minWindow);
 		}
 		// A model switch may trigger context compaction, whose summary uses the
 		// PREVIOUS routed model. If the previous model is the one that is failing,
@@ -345,7 +387,9 @@ export async function apply(ctx, rawConfig) {
 			// summary uses the failing previous model — a guaranteed dead end.
 			// Treat an UNKNOWN window as acceptable: dropping it would discard the
 			// user's configured chain whenever the registry could not be read.
-			const largeEnough = list.filter((c) => c.contextWindow === undefined || (c.contextWindow ?? 0) >= currentWindow);
+			const largeEnough = list.filter((c) => keepIfChain(c)
+				|| c.contextWindow === undefined
+				|| (c.contextWindow ?? 0) >= currentWindow);
 			// Never empty the pool: if no candidate is large enough, keep the
 			// sorted full list so the session can still move forward.
 			list = largeEnough.length > 0 ? largeEnough : list;
@@ -357,12 +401,10 @@ export async function apply(ctx, rawConfig) {
 			sortable.sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
 			list = [...fixed, ...sortable];
 		}
-		// Last resort: a configured chain whose every entry is the current model or
-		// blocked would otherwise strand the session, so widen to the registry.
-		if (chainConfigured && list.length === 0) {
-			pushRegistry();
-			list = ordered.filter((candidate) => !(candidate.provider === excludeProvider && candidate.model === excludeModel));
-		}
+		// A configured chain is strict: if every entry is unavailable, the session
+		// must surface the failure rather than silently wander into another
+		// provider's catalog. (Widening here was the last route by which a user's
+		// chain could be ignored.)
 		return list;
 	}
 
@@ -409,6 +451,8 @@ export async function apply(ctx, rawConfig) {
 	}
 
 	async function recover({ agent, turn, step, provider, failure, signal }, next) {
+		// Always read the live chain: a save must apply to the very next failure.
+		await syncConfig(true);
 		if (lifetime.signal.aborted || config.enabled === false) return next();
 		if (signal?.aborted) return next();
 		const code = failure?.code;
@@ -500,6 +544,7 @@ export async function apply(ctx, rawConfig) {
 	 * continue (the model itself was never the problem).
 	 */
 	async function resumeIdle(agent, pending) {
+		await syncConfig(true);
 		// Hard cap, checked here (not only in the status listener) so a re-armed
 		// pending record from a later agent/error cannot bypass the budget.
 		const used = idleResumes.get(agent.id) ?? 0;
@@ -655,6 +700,10 @@ export async function apply(ctx, rawConfig) {
 			try { return typeof sctx.get === "function" ? sctx.get("settings") : undefined; }
 			catch { return undefined; }
 		};
+		// Publish the service to the switching logic so `syncConfig()` can re-read
+		// the live values without a restart.
+		settingsRef = settingsOf();
+		void syncConfig(true);
 		/** Every route the profile's providers expose right now, for the pickers. */
 		const modelCatalog = async () => {
 			const routes = [];
@@ -749,7 +798,19 @@ export async function apply(ctx, rawConfig) {
 		}, "auto-continue: settings bridge");
 	});
 
+	// A save on the settings page fires this; reload immediately so the very next
+	// failure already uses the new chain (no restart, no stale snapshot).
+	let disposeSettings = () => {};
+	try {
+		disposeSettings = ctx.on("settings/document-updated", (ns) => {
+			if (String(ns) === SETTINGS_NS) void syncConfig(true);
+		});
+	} catch (error) {
+		ctx.logger.warn(`auto-continue: settings change listener unavailable (${error instanceof Error ? error.message : String(error)})`);
+	}
+
 	ctx.effect(() => async () => {
+		try { disposeSettings(); } catch { /* already disposed */ }
 		disposeRequestError();
 		disposeTurnStopping();
 		disposeAgentError();
