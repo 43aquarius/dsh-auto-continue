@@ -94,6 +94,27 @@ test("P4 the declared entry files all exist", () => {
 	}
 });
 
+test("P4b wildcard entries have their parent directory on disk", () => {
+	// The Host scans a declared wildcard directory and throws ENOENT when it is
+	// absent: "Plugin metadata ... ENOENT: no such file or directory, scandir
+	// ...\locale". Declaring `locale/*.json` without a locale/ dir is a hard error.
+	const pkg = JSON.parse(fs.readFileSync(path.join(BUNDLE, "package.json"), "utf8"));
+	const wildcards = [];
+	for (const target of Object.values(pkg.exports ?? {})) {
+		if (typeof target === "string" && target.includes("*")) wildcards.push(target);
+	}
+	for (const file of pkg.files ?? []) {
+		if (typeof file === "string" && file.includes("*")) wildcards.push(file);
+	}
+	const missing = [];
+	for (const spec of wildcards) {
+		const dir = spec.slice(0, spec.indexOf("*")).replace(/\/+$/, "");
+		if (dir === "") continue; // e.g. "./*" — the package root always exists
+		if (!fs.existsSync(path.join(BUNDLE, dir))) missing.push(`${spec} (no ${dir}/)`);
+	}
+	assert.deepStrictEqual(missing, [], "wildcard entries point at absent directories: " + missing.join(", "));
+});
+
 test("P5 the bundle patch declares the package's own name", () => {
 	// The Loader resolves the row's `name` as a module specifier. A patch that
 	// names something else (the repo name instead of the package name) is the
