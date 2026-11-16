@@ -218,6 +218,70 @@ export async function apply(ctx, rawConfig) {
 	const pendingResume = new Map();
 	/** agent id -> idle-resume attempts consumed this host lifetime. */
 	const idleResumes = new Map();
+	/**
+	 * route key -> until. Destinations whose switch failed because the harness
+	 * could not compact the transcript. These are NOT broken routes (the model
+	 * itself works), but re-picking one immediately re-triggers the same failed
+	 * compaction — the ping-pong observed between two chain entries.
+	 */
+	const compactionBlocked = new Map();
+	/** agent id -> { count, at } — consecutive compaction-caused switch failures. */
+	const compactionStreak = new Map();
+	/** agent id -> until. Automatic switching is paused: the transcript cannot be
+	 * compacted while the PREVIOUS model is rate-limited, so every candidate with a
+	 * smaller window fails identically. Surfacing the error beats thrashing. */
+	const switchSuspended = new Map();
+	/** agent id -> { from, to, at } — the most recent switch, used to avoid
+	 * bouncing straight back to the model we just left. */
+	const lastSwitch = new Map();
+	const COMPACTION_CODE = "MODEL_SWITCH_COMPACTION_FAILED";
+	const COMPACTION_BLOCK_MS = 10 * 60 * 1000;
+	const SUSPEND_MS = 15 * 60 * 1000;
+
+	/**
+	 * Record one compaction-caused switch failure: block the destination that
+	 * triggered it and, on the second strike, pause switching for this agent.
+	 * Returns true when the caller must stop switching now.
+	 */
+	function noteCompactionFailure(agentId, route) {
+		const now = Date.now();
+		if (route) compactionBlocked.set(route, now + COMPACTION_BLOCK_MS);
+		// Also block where we came from: bouncing straight back to the previous
+		// model is exactly the A <-> B ping-pong this guards against.
+		const previous = lastSwitch.get(agentId);
+		if (previous && previous.from && now - previous.at < COMPACTION_BLOCK_MS) {
+			compactionBlocked.set(previous.from, now + COMPACTION_BLOCK_MS);
+		}
+		const prior = compactionStreak.get(agentId);
+		const count = prior && now - prior.at < SUSPEND_MS ? prior.count + 1 : 1;
+		compactionStreak.set(agentId, { count, at: now });
+		if (count >= 2) {
+			switchSuspended.set(agentId, now + SUSPEND_MS);
+			return true;
+		}
+		return false;
+	}
+
+	/** True when this agent's switching is paused (compaction deadlock). */
+	function isSuspended(agentId) {
+		const until = switchSuspended.get(agentId);
+		if (until === undefined) return false;
+		if (until > Date.now()) return true;
+		switchSuspended.delete(agentId);
+		compactionStreak.delete(agentId);
+		return false;
+	}
+
+	/** Skip destinations known to break the switch (compaction) or cooling down. */
+	function isUnusable(provider, model) {
+		const key = routeKey(provider, model);
+		const blockedUntil = compactionBlocked.get(key);
+		if (blockedUntil !== undefined) {
+			if (blockedUntil > Date.now()) return true;
+			compactionBlocked.delete(key);
+		}
+		return false;
+	}
 
 	const SWITCH_RECORD_TYPE = "plugin:auto-continue/switch";
 	/** Record a model switch via the plugin-record path; never via plain append(). */
@@ -462,6 +526,23 @@ export async function apply(ctx, rawConfig) {
 		const failedProvider = provider ?? current?.provider;
 		const failedModel = current?.model;
 		if (!failedProvider || !failedModel) return next();
+		// Compaction deadlock: the switch target itself failed to be adopted because
+		// the transcript cannot be compacted (the summarizer runs on the previous,
+		// currently rate-limited model). Block that destination, and after a second
+		// strike pause automatic switching instead of ping-ponging between entries.
+		if (code === COMPACTION_CODE) {
+			const route = routeKey(failedProvider, failedModel);
+			const paused = noteCompactionFailure(agent.id, route);
+			ctx.logger.warn(`auto-continue: switch to "${route}" rejected (context compaction failed); blocking it for ${COMPACTION_BLOCK_MS / 60000}m`);
+			if (paused) {
+				ctx.logger.warn(`auto-continue: pausing automatic switching for session "${agent.id}" for ${SUSPEND_MS / 60000}m — the transcript cannot be compacted while the previous model is failing; fix the failing model or wait out the limit`);
+				return next();
+			}
+		}
+		if (isSuspended(agent.id)) {
+			ctx.logger.warn(`auto-continue: session "${agent.id}" automatic switching is paused (compaction deadlock); surfacing the error`);
+			return next();
+		}
 		if (typeof agent.model.select !== "function" || typeof agent.followup !== "function" || typeof agent.cancel !== "function") {
 			ctx.logger.warn(`auto-continue: agent "${agent.id}" lacks the select/cancel/followup surface; skipping`);
 			return next();
@@ -479,7 +560,9 @@ export async function apply(ctx, rawConfig) {
 		markRoute(failedProvider, failedModel, code, failure.providerRetryAfterMs);
 
 		const currentWindow = await currentModelWindow(failedProvider, failedModel);
-		const pool = (await listCandidates(failedProvider, failedModel, code, currentWindow)).filter((candidate) => !isCooling(candidate.provider, candidate.model));
+		const pool = (await listCandidates(failedProvider, failedModel, code, currentWindow))
+			.filter((candidate) => !isCooling(candidate.provider, candidate.model))
+			.filter((candidate) => !isUnusable(candidate.provider, candidate.model));
 		let chosen;
 		let probed = 0;
 		for (const candidate of pool) {
@@ -517,6 +600,11 @@ export async function apply(ctx, rawConfig) {
 		// 1. Durable model switch — the next step picks it up and the loop renders
 		//    its own "[model changed: ...]" notice.
 		agent.model.select({ provider: chosen.provider, model: chosen.model });
+		lastSwitch.set(agent.id, {
+			from: routeKey(failedProvider, failedModel),
+			to: routeKey(chosen.provider, chosen.model),
+			at: Date.now()
+		});
 		// 2. Durable observability record — plugin-record path only (ignorable:true).
 		recordSwitch(agent, {
 			turn,
@@ -567,10 +655,28 @@ export async function apply(ctx, rawConfig) {
 			return;
 		}
 		const current = agent.model.current();
+		// Same compaction deadlock as recover(): block the destination that could not
+		// be adopted and pause after a second strike.
+		if (pending.code === COMPACTION_CODE) {
+			const route = current?.provider && current?.model ? routeKey(current.provider, current.model) : "";
+			const paused = noteCompactionFailure(agent.id, route);
+			ctx.logger.warn(`auto-continue: idle-resume switch to "${route}" rejected (context compaction failed); blocking it`);
+			if (paused) {
+				ctx.logger.warn(`auto-continue: pausing automatic switching for session "${agent.id}" (compaction deadlock); leaving the error surfaced`);
+				pendingResume.delete(agent.id);
+				return;
+			}
+		}
+		if (isSuspended(agent.id)) {
+			ctx.logger.warn(`auto-continue: session "${agent.id}" automatic switching is paused (compaction deadlock); skipping idle resume`);
+			pendingResume.delete(agent.id);
+			return;
+		}
 		// Idle resume probes ignore cooldowns: it is a low-frequency retry window,
 		// and cooldown-blocked candidates would leave the session stranded forever.
 		const currentWindow = await currentModelWindow(current?.provider, current?.model);
-		const pool = await listCandidates(current?.provider, current?.model, pending.code, currentWindow);
+		const pool = (await listCandidates(current?.provider, current?.model, pending.code, currentWindow))
+			.filter((candidate) => !isUnusable(candidate.provider, candidate.model));
 		for (const candidate of pool) {
 			if (lifetime.signal.aborted) { pendingResume.delete(agent.id); return; }
 			const verdict = await probeRoute(candidate, undefined);
@@ -579,6 +685,11 @@ export async function apply(ctx, rawConfig) {
 				healthy.set(routeKey(candidate.provider, candidate.model), { until: Date.now() + config.healthyTtlMs });
 				if (current?.provider && current?.model) {
 					agent.model.select({ provider: candidate.provider, model: candidate.model });
+					lastSwitch.set(agent.id, {
+						from: routeKey(current.provider, current.model),
+						to: routeKey(candidate.provider, candidate.model),
+						at: Date.now()
+					});
 					recordSwitch(agent, { source: "idle-resume", from: { provider: current.provider, model: current.model }, to: { provider: candidate.provider, model: candidate.model }, failure: { code: pending.code, message: pending.message } });
 				}
 				agent.followup(anyUserMessage(config.continuationText));
@@ -656,6 +767,9 @@ export async function apply(ctx, rawConfig) {
 		switches.delete(agent.id);
 		pendingResume.delete(agent.id);
 		idleResumes.delete(agent.id);
+		compactionStreak.delete(agent.id);
+		switchSuspended.delete(agent.id);
+		lastSwitch.delete(agent.id);
 	}, GLOBAL);
 	// ── Settings bridge ────────────────────────────────────────────────────
 	// This profile does not mount the shipped config-form subsystem, so the
@@ -742,7 +856,19 @@ export async function apply(ctx, rawConfig) {
 					ctx.logger.warn(`auto-continue: settings.describe failed (${error instanceof Error ? error.message : String(error)})`);
 				}
 			}
-			return { ok: true, writable, config: normalizeConfig(value), models: await modelCatalog() };
+			return {
+				ok: true,
+				writable,
+				config: normalizeConfig(value),
+				models: await modelCatalog(),
+				// Live diagnostics: why a configured chain entry may be skipped.
+				blocked: [...compactionBlocked.entries()]
+					.filter(([, until]) => until > Date.now())
+					.map(([route, until]) => ({ route, reason: "context compaction failed", secondsLeft: Math.round((until - Date.now()) / 1000) })),
+				suspended: [...switchSuspended.entries()]
+					.filter(([, until]) => until > Date.now())
+					.map(([agentId, until]) => ({ agentId, reason: "compaction deadlock", secondsLeft: Math.round((until - Date.now()) / 1000) }))
+			};
 		};
 		const writeState = async (body) => {
 			const settings = settingsOf();
