@@ -155,7 +155,7 @@ const optionTexts = (sel) => (sel.children ?? []).filter((o) => o.type === "opti
 const fieldSelects = selects.filter((sel) => optionTexts(sel).some((t) => t.includes("★推荐")));
 const filterSelects = selects.filter((sel) => optionTexts(sel).some((t) => t.startsWith("全部厂商")));
 console.log("fieldSelects:", fieldSelects.length, "filterSelects:", filterSelects.length);
-if (fieldSelects.length !== 19) throw new Error(`expected 19 field selects, got ${fieldSelects.length}`);
+if (fieldSelects.length !== 18) throw new Error(`expected 18 field selects, got ${fieldSelects.length}`);
 if (filterSelects.length !== 1) throw new Error(`expected 1 provider filter select, got ${filterSelects.length}`);
 if (!optionTexts(filterSelects[0]).some((t) => t.includes(`（${MODELS.length} 个模型）`))) {
 	throw new Error("provider filter must report the live catalog size, got " + optionTexts(filterSelects[0]).join(" | "));

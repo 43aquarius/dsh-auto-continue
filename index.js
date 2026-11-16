@@ -69,7 +69,6 @@ const DEFAULTS = {
 	// permanently-dead model can never spin forever (see IDLE_RESUME_HARD_CAP).
 	maxIdleResumes: 0,
 	cooldownModelFaultMs: 1800000,
-	preferLargeContext: true,
 	minContextWindow: 0
 };
 
@@ -162,7 +161,6 @@ if (z) {
 		resumeOnErrorIdle: z.boolean().default(DEFAULTS.resumeOnErrorIdle).description("回合以错误收尾且没有排定续接时，空闲后自动兜底续接（覆盖 request-error 之外的失败）").volatile(),
 		maxIdleResumes: z.number().default(DEFAULTS.maxIdleResumes).description("每个会话在每个宿主生命周期内兜底续接的最大次数").volatile(),
 		cooldownModelFaultMs: z.number().default(DEFAULTS.cooldownModelFaultMs).description("模型级持续故障（PI_AI_ERROR/MODEL_SWITCH_COMPACTION_FAILED 等）的冷却时间（毫秒）").volatile(),
-		preferLargeContext: z.boolean().default(DEFAULTS.preferLargeContext).description("切换时优先选择上下文窗口足够大的模型，避免切过去触发历史压缩（压缩摘要仍用旧模型，旧模型限流时会失败）").volatile(),
 		minContextWindow: z.number().default(DEFAULTS.minContextWindow).description("候选模型的最小上下文窗口（token，0=不限制）；低于此值的模型不作为切换目标").volatile(),
 	});
 }
@@ -189,7 +187,9 @@ function normalizeConfig(raw) {
 	const strArray = (key) => {
 		if (!Array.isArray(out[key]) || out[key].some((x) => typeof x !== "string")) out[key] = DEFAULTS[key];
 	};
-	for (const k of ["enabled", "probe", "resumeOnErrorIdle", "preferLargeContext"]) bool(k);
+	// The window-preference switch is gone: selection follows the configured chain.
+	delete out.preferLargeContext;
+	for (const k of ["enabled", "probe", "resumeOnErrorIdle"]) bool(k);
 	for (const k of ["maxSwitchesPerTurn", "probeTimeoutMs", "probeMaxTokens", "maxProbeCandidates",
 		"switchAfterMs", "cooldownQuotaMs", "cooldownRateLimitMs", "cooldownAuthMs",
 		"cooldownTransientMs", "healthyTtlMs", "maxIdleResumes", "cooldownModelFaultMs",
@@ -374,7 +374,7 @@ export async function apply(ctx, rawConfig) {
 	const NON_CHAT_MODEL = /^(?:\d+|.*image-gen.*|.*-image|.*_image)$/i;
 
 	/** Enumerate fallback candidates: explicit chain first, then the full registry. */
-	async function listCandidates(excludeProvider, excludeModel, failureCode, currentWindow) {
+	async function listCandidates(excludeProvider, excludeModel) {
 		// Collect the live registry FIRST: an explicit chain entry needs its real
 		// context window, and a chain entry must never be dropped merely because
 		// its window is unknown.
@@ -429,9 +429,9 @@ export async function apply(ctx, rawConfig) {
 		if (!chainConfigured) pushRegistry();
 
 		let list = ordered.filter((candidate) => !(candidate.provider === excludeProvider && candidate.model === excludeModel));
-		// Hand-picked chain routes are exempt from the window heuristics below:
-		// the user picked them deliberately, so a small window must not silently
-		// delete one from its position.
+		// Selection order is the configured chain, full stop. No window heuristic
+		// reorders or removes entries: the user's list IS the priority. Hand-picked
+		// chain routes are also exempt from the optional minContextWindow filter.
 		const chainKeys = new Set(chainRoutes.map((raw) => routeKey(raw.provider, raw.model)));
 		const keepIfChain = (candidate) => chainKeys.has(routeKey(candidate.provider, candidate.model));
 		const minWindow = Math.max(0, Number(config.minContextWindow) || 0);
@@ -440,86 +440,10 @@ export async function apply(ctx, rawConfig) {
 				|| candidate.contextWindow === undefined
 				|| (candidate.contextWindow ?? 0) >= minWindow);
 		}
-		// A model switch may trigger context compaction, whose summary uses the
-		// PREVIOUS routed model. If that model is the one failing, compaction fails
-		// and the harness refuses the switch with MODEL_SWITCH_COMPACTION_FAILED —
-		// the ping-pong loop. Prefer destinations that need NO compaction: their
-		// window is at least the current one. Windows come from resolveModelInfo,
-		// because listModels() reports none in this deployment.
-		const wantLarge = config.preferLargeContext === true || failureCode === "CONTEXT_WINDOW_EXCEEDED" || MODEL_FAULT_CODES.has(failureCode) || SWITCH_TRANSITION_CODES.has(failureCode);
-		if (wantLarge && Number.isFinite(currentWindow) && currentWindow > 0) {
-			let lookups = 0;
-			for (const candidate of list) {
-				if (typeof candidate.contextWindow === "number" && candidate.contextWindow > 0) continue;
-				if (lookups >= MAX_WINDOW_LOOKUPS) break;
-				lookups += 1;
-				const window = await resolveWindow(candidate.provider, candidate.model);
-				if (typeof window === "number") candidate.contextWindow = window;
-			}
-			// Three stable groups, each keeping the configured chain order:
-			//   1. known to fit (no compaction), 2. unknown, 3. known too small.
-			// Nothing is dropped — a small-window entry is still a valid last resort.
-			const fits = [];
-			const unknown = [];
-			const tooSmall = [];
-			for (const candidate of list) {
-				const window = candidate.contextWindow;
-				if (typeof window !== "number" || window <= 0) unknown.push(candidate);
-				else if (window >= currentWindow) fits.push(candidate);
-				else tooSmall.push(candidate);
-			}
-			list = [...fits, ...unknown, ...tooSmall];
-		}
 		// A configured chain is strict: if every entry is unavailable, the session
 		// must surface the failure rather than silently wander into another
-		// provider's catalog. (Widening here was the last route by which a user's
-		// chain could be ignored.)
+		// provider's catalog.
 		return list;
-	}
-
-	/**
-	 * route key -> { value, at }. `llm.listModels()` returns no context window in
-	 * this deployment (every entry reports 0), so windows are resolved through
-	 * `resolveModelInfo`, whose `context.contextWindow` is the real value DSH uses
-	 * when deciding whether a model switch needs transcript compaction.
-	 */
-	const windowCache = new Map();
-	const WINDOW_TTL = 10 * 60 * 1000;
-	const WINDOW_MISS_TTL = 60 * 1000;
-	/** Bound per-event lookups: the chain is small, a bare registry is not. */
-	const MAX_WINDOW_LOOKUPS = 24;
-
-	async function resolveWindow(provider, model) {
-		const key = routeKey(provider, model);
-		const now = Date.now();
-		const cached = windowCache.get(key);
-		if (cached !== undefined) {
-			const ttl = cached.value === undefined ? WINDOW_MISS_TTL : WINDOW_TTL;
-			if (now - cached.at < ttl) return cached.value;
-		}
-		let value;
-		try {
-			if (typeof ctx.llm.resolveModelInfo === "function") {
-				const info = await ctx.llm.resolveModelInfo(provider, model);
-				const window = info?.context?.contextWindow;
-				if (typeof window === "number" && window > 0) value = window;
-			}
-		} catch { /* adapter could not resolve this route */ }
-		if (value === undefined) {
-			try {
-				const models = await ctx.llm.listModels(provider);
-				const found = models.find((entry) => entry.id === model);
-				if (typeof found?.contextWindow === "number" && found.contextWindow > 0) value = found.contextWindow;
-			} catch { /* ignore */ }
-		}
-		windowCache.set(key, { value, at: now });
-		return value;
-	}
-
-	/** Look up a model's context window from the live registry (best effort). */
-	async function currentModelWindow(provider, model) {
-		if (!provider || !model) return undefined;
-		return resolveWindow(provider, model);
 	}
 
 	/** One tiny real request to verify a candidate actually works right now. */
@@ -598,8 +522,7 @@ export async function apply(ctx, rawConfig) {
 		// Remember the failing route before anything else, so it is not picked as its own fallback.
 		markRoute(failedProvider, failedModel, code, failure.providerRetryAfterMs);
 
-		const currentWindow = await currentModelWindow(failedProvider, failedModel);
-		const pool = (await listCandidates(failedProvider, failedModel, code, currentWindow))
+		const pool = (await listCandidates(failedProvider, failedModel))
 			.filter((candidate) => !isCooling(candidate.provider, candidate.model))
 			.filter((candidate) => !isUnusable(candidate.provider, candidate.model));
 		let chosen;
@@ -713,8 +636,7 @@ export async function apply(ctx, rawConfig) {
 		}
 		// Idle resume probes ignore cooldowns: it is a low-frequency retry window,
 		// and cooldown-blocked candidates would leave the session stranded forever.
-		const currentWindow = await currentModelWindow(current?.provider, current?.model);
-		const pool = (await listCandidates(current?.provider, current?.model, pending.code, currentWindow))
+		const pool = (await listCandidates(current?.provider, current?.model))
 			.filter((candidate) => !isUnusable(candidate.provider, candidate.model));
 		for (const candidate of pool) {
 			if (lifetime.signal.aborted) { pendingResume.delete(agent.id); return; }
@@ -906,13 +828,7 @@ export async function apply(ctx, rawConfig) {
 					.map(([route, until]) => ({ route, reason: "context compaction failed", secondsLeft: Math.round((until - Date.now()) / 1000) })),
 				suspended: [...switchSuspended.entries()]
 					.filter(([, until]) => until > Date.now())
-					.map(([agentId, until]) => ({ agentId, reason: "compaction deadlock", secondsLeft: Math.round((until - Date.now()) / 1000) })),
-				// Windows the plugin actually resolved (listModels reports none).
-				windows: Object.fromEntries(
-					[...windowCache.entries()]
-						.filter(([, entry]) => typeof entry.value === "number")
-						.map(([route, entry]) => [route, entry.value])
-				)
+					.map(([agentId, until]) => ({ agentId, reason: "compaction deadlock", secondsLeft: Math.round((until - Date.now()) / 1000) }))
 			};
 		};
 		const writeState = async (body) => {

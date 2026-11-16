@@ -322,15 +322,18 @@ async function run() {
 		console.log("SCENARIO 8 PASS — LLM fault code preserved; idle resume switched to", record.selects[0].provider);
 	}
 
-	// ---- Scenario 9: preferLargeContext picks a destination with a window >=
-	//      the current one, so a switch never triggers compaction (whose summary
-	//      uses the failing previous model).
+	// ---- Scenario 9: no window preference. Order decides: the FIRST registered
+	//      provider wins even when a later one advertises a much bigger window
+	//      (the window heuristic was removed on the user's request).
 	{
 		const llm = makeLlm({ stormRaccoon: false });
 		llm.listModels = async (provider) => {
-			const windows = { "raccoon-vision": 192000, "trae-vision": 1000000, loomy: 128000 };
+			// loomy advertises 128k and is registered first; trae-vision advertises
+			// 1M but comes second.
+			const windows = { "raccoon-vision": 192000, loomy: 128000, "trae-vision": 1000000 };
 			return (windows[provider] ? [{ id: provider === "raccoon-vision" ? "sn-glm-5-3" : (provider === "trae-vision" ? "glm-5.3" : "GLM-5.3-Flash"), name: provider, contextWindow: windows[provider] }] : []);
 		};
+		llm.listProviders = () => [{ id: "raccoon-vision", name: "raccoon-vision" }, { id: "loomy", name: "loomy" }, { id: "trae-vision", name: "trae-vision" }];
 		const listeners = {};
 		const ctx = {
 			llm,
@@ -338,15 +341,15 @@ async function run() {
 			on(name, listener) { listeners[name] = listener; return () => {}; },
 			effect() {}
 		};
-		await mod.apply(ctx, { preferLargeContext: true });
+		await mod.apply(ctx, {});
 		const { agent, record } = makeAgent();
 		await listeners["agent/request-error"](
 			{ agent, turn: 3, step: 1, provider: "raccoon-vision", failure: { code: "QUOTA", message: "quota" }, signal: new AbortController().signal },
 			async () => undefined
 		);
 		assert.strictEqual(record.selects.length, 1, "switched once");
-		assert.strictEqual(record.selects[0].provider, "trae-vision", "chose the only candidate whose window >= current (192000): " + JSON.stringify(record.selects[0]));
-		console.log("SCENARIO 9 PASS — large-window candidate preferred");
+		assert.strictEqual(record.selects[0].provider, "loomy", "first registered candidate wins regardless of window: " + JSON.stringify(record.selects[0]));
+		console.log("SCENARIO 9 PASS — order decides, no window preference");
 	}
 
 	console.log("\nALL SCENARIOS PASS");

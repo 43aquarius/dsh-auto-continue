@@ -228,7 +228,9 @@ async function run() {
 		// unless the schema marks fields volatile. Assert it on the real schema.
 		assert.ok(mod.Config, "Config schema must be built (schemastery reachable)");
 		const keys = Object.keys(mod.Config.dict ?? {});
-		assert.ok(keys.length >= 20, `expected the full field set, got ${keys.length}`);
+		// 19 fields: preferLargeContext was removed on the user's request, so selection
+		// follows the configured chain order and nothing else.
+		assert.ok(keys.length >= 19, `expected the full field set, got ${keys.length}`);
 		const notVolatile = [];
 		for (const key of keys) {
 			const node = mod.Config.dict[key];

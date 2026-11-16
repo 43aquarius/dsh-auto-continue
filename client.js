@@ -85,11 +85,7 @@ window.__ModuleLoader__.load({
 				options: [opt("不限制（推荐）", 0, true), opt("1 次", 1), opt("2 次", 2), opt("3 次", 3), opt("5 次", 5), opt("10 次", 10)]
 			},
 			{
-				key: "preferLargeContext", label: "优先选大窗口模型", hint: "目标窗口不小于当前模型，避免切换触发历史压缩", group: "advanced",
-				options: [opt("开启（推荐）", true, true), opt("关闭（按注册顺序选）", false)]
-			},
-			{
-				key: "minContextWindow", label: "最小上下文窗口", hint: "低于该值的模型不作为切换目标", group: "advanced",
+				key: "minContextWindow", label: "最小上下文窗口", hint: "低于该值的模型不作为切换目标；你手动加进链的模型不受此限制", group: "advanced",
 				options: [opt("不限制（推荐）", 0, true), opt("≥ 128K", 128000), opt("≥ 200K", 200000), opt("≥ 500K", 500000)]
 			},
 			{

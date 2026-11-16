@@ -50,7 +50,7 @@ async function mount(mod, { chain, failing = new Set(), enabled = true, probe = 
 
 	const settings = {
 		writable: true,
-		describe: () => [{ ns: "auto-continue", value: { enabled, fallbackChain: chain, probe, preferLargeContext: true, minContextWindow: 0, ignoreCodes: ["ABORTED"] }, writable: true }],
+		describe: () => [{ ns: "auto-continue", value: { enabled, fallbackChain: chain, probe, minContextWindow: 0, ignoreCodes: ["ABORTED"] }, writable: true }],
 		mutate: async () => {}
 	};
 
@@ -184,7 +184,7 @@ async function run() {
 		assert.deepStrictEqual(selected, [], "nothing healthy in the initial chain");
 		// User edits the chain in the settings page: a brand-new healthy route.
 		const replacement = [CHAIN[2], CHAIN[3]];
-		settings.describe = () => [{ ns: "auto-continue", value: { enabled: true, fallbackChain: replacement, probe: true, preferLargeContext: true, minContextWindow: 0, ignoreCodes: ["ABORTED"] }, writable: true }];
+		settings.describe = () => [{ ns: "auto-continue", value: { enabled: true, fallbackChain: replacement, probe: true, minContextWindow: 0, ignoreCodes: ["ABORTED"] }, writable: true }];
 		await requestError(2);
 		assert.deepStrictEqual(selected, [CHAIN[2]], "the runtime-saved chain must be used immediately, got " + JSON.stringify(selected));
 	});
@@ -200,9 +200,9 @@ async function run() {
 	});
 
 	await test("C8 small-window chain entries are still used: the chain beats window heuristics", async () => {
-		// Providers that DO report windows must not let preferLargeContext /
-		// minContextWindow rewrite the user's order. Here the current model has a
-		// huge window and the chain entries have tiny ones; the chain still wins.
+		// Providers that DO report windows must not let the optional minContextWindow
+		// filter rewrite the user's order. Here the current model has a huge window
+		// and the chain entries have tiny ones; the chain still wins, in order.
 		const routeA = CHAIN[2];
 		const routeB = CHAIN[3];
 		const mod2 = await import(pathToFileURL(path.join(BUNDLE, "index.js")).href + "?v=windows");
@@ -234,7 +234,7 @@ async function run() {
 			effect() {},
 			inject(keys, cb) { cb({ get: () => undefined, logger: ctx.logger, effect: (fn) => ({ dispose: fn() }), webServer: { register: () => () => {} } }); }
 		};
-		await mod2.apply(ctx, { fallbackChain: [routeA, routeB], preferLargeContext: true, minContextWindow: 200000 });
+		await mod2.apply(ctx, { fallbackChain: [routeA, routeB], minContextWindow: 200000 });
 		await listeners["agent/request-error"]({
 			agent, turn: 1, step: 1, provider: "big", model: "huge",
 			failure: { code: "RATE_LIMIT", message: "429" },

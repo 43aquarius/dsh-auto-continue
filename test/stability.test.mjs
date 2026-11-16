@@ -188,12 +188,10 @@ async function run() {
 
 	// --- T6d: an explicit chain must win even when registry windows are larger
 	await test("T6d explicit chain wins over larger registry windows", async () => {
-		// The bug: chain entries entered the pool without a contextWindow, the
-		// preferLargeContext filter scored them as 0 and dropped every one, and
-		// the pool then held only registry candidates sorted by window size — the
-		// session walked a foreign provider's list instead of the configured chain.
-		// The registry here carries a BIGGER, non-junk chat model on purpose, so a
-		// regression that lets the registry back into a configured chain fails.
+		// The chain is the only source of candidates once configured; a registry
+		// entry with a much bigger window must never displace it. The registry here
+		// carries a BIGGER, non-junk chat model on purpose, so a regression that
+		// lets the registry back into a configured chain fails.
 		const catalog = {
 			"trae-vision": [{ id: "glm-5.3", contextWindow: 1000000 }],
 			doubao: [
@@ -223,8 +221,7 @@ async function run() {
 		};
 		const chain = ["loomy/GLM-5.3-Flash", "loomy/deepseek-v4-flash-1017"];
 		const { call, cleanup } = await mount(mod, {
-			fallbackChain: chain,
-			preferLargeContext: true
+			fallbackChain: chain
 		}, llm);
 		await call("agent/request-error", basePayload({
 			agent: made.agent,
@@ -263,7 +260,7 @@ async function run() {
 			current: () => ({ provider: "trae-vision", model: "glm-5.3" }),
 			select: (s) => made.record.selects.push(s)
 		};
-		const { call, cleanup } = await mount(mod, { fallbackChain: [], preferLargeContext: true }, llm);
+		const { call, cleanup } = await mount(mod, { fallbackChain: [] }, llm);
 		await call("agent/request-error", basePayload({
 			agent: made.agent,
 			provider: "trae-vision",
@@ -279,7 +276,7 @@ async function run() {
 	// --- T6f: a chain entry whose provider is temporarily unregistered survives
 	await test("T6f chain entry with an unknown window is still usable", async () => {
 		// A provider that is still registering reports no model list, so the chain
-		// route has no known context window. minContextWindow / preferLargeContext
+		// route has no known context window. The optional minContextWindow filter
 		// must not treat "unknown" as "too small" and silently drop the user's
 		// configured chain entry.
 		const catalog = {
@@ -301,7 +298,6 @@ async function run() {
 		};
 		const { call, cleanup } = await mount(mod, {
 			fallbackChain: ["late-provider/not-yet-listed"],
-			preferLargeContext: true,
 			minContextWindow: 200000
 		}, llm);
 		await call("agent/request-error", basePayload({
