@@ -441,29 +441,34 @@ export async function apply(ctx, rawConfig) {
 				|| (candidate.contextWindow ?? 0) >= minWindow);
 		}
 		// A model switch may trigger context compaction, whose summary uses the
-		// PREVIOUS routed model. If the previous model is the one that is failing,
-		// compaction fails and the harness refuses the switch with
-		// MODEL_SWITCH_COMPACTION_FAILED, so prefer a destination whose window is
-		// at least as large as the current one (no compaction needed at all).
+		// PREVIOUS routed model. If that model is the one failing, compaction fails
+		// and the harness refuses the switch with MODEL_SWITCH_COMPACTION_FAILED —
+		// the ping-pong loop. Prefer destinations that need NO compaction: their
+		// window is at least the current one. Windows come from resolveModelInfo,
+		// because listModels() reports none in this deployment.
 		const wantLarge = config.preferLargeContext === true || failureCode === "CONTEXT_WINDOW_EXCEEDED" || MODEL_FAULT_CODES.has(failureCode) || SWITCH_TRANSITION_CODES.has(failureCode);
 		if (wantLarge && Number.isFinite(currentWindow) && currentWindow > 0) {
-			// Destinations smaller than the current window force compaction, whose
-			// summary uses the failing previous model — a guaranteed dead end.
-			// Treat an UNKNOWN window as acceptable: dropping it would discard the
-			// user's configured chain whenever the registry could not be read.
-			const largeEnough = list.filter((c) => keepIfChain(c)
-				|| c.contextWindow === undefined
-				|| (c.contextWindow ?? 0) >= currentWindow);
-			// Never empty the pool: if no candidate is large enough, keep the
-			// sorted full list so the session can still move forward.
-			list = largeEnough.length > 0 ? largeEnough : list;
-			// Explicit fallbackChain keeps its order (user's priority wins); only
-			// registry-derived candidates are sorted by descending window.
-			const pinned = new Set(chainRoutes.map((raw) => routeKey(raw.provider, raw.model)));
-			const sortable = list.filter((c) => !pinned.has(routeKey(c.provider, c.model)));
-			const fixed = list.filter((c) => pinned.has(routeKey(c.provider, c.model)));
-			sortable.sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
-			list = [...fixed, ...sortable];
+			let lookups = 0;
+			for (const candidate of list) {
+				if (typeof candidate.contextWindow === "number" && candidate.contextWindow > 0) continue;
+				if (lookups >= MAX_WINDOW_LOOKUPS) break;
+				lookups += 1;
+				const window = await resolveWindow(candidate.provider, candidate.model);
+				if (typeof window === "number") candidate.contextWindow = window;
+			}
+			// Three stable groups, each keeping the configured chain order:
+			//   1. known to fit (no compaction), 2. unknown, 3. known too small.
+			// Nothing is dropped — a small-window entry is still a valid last resort.
+			const fits = [];
+			const unknown = [];
+			const tooSmall = [];
+			for (const candidate of list) {
+				const window = candidate.contextWindow;
+				if (typeof window !== "number" || window <= 0) unknown.push(candidate);
+				else if (window >= currentWindow) fits.push(candidate);
+				else tooSmall.push(candidate);
+			}
+			list = [...fits, ...unknown, ...tooSmall];
 		}
 		// A configured chain is strict: if every entry is unavailable, the session
 		// must surface the failure rather than silently wander into another
@@ -472,15 +477,49 @@ export async function apply(ctx, rawConfig) {
 		return list;
 	}
 
+	/**
+	 * route key -> { value, at }. `llm.listModels()` returns no context window in
+	 * this deployment (every entry reports 0), so windows are resolved through
+	 * `resolveModelInfo`, whose `context.contextWindow` is the real value DSH uses
+	 * when deciding whether a model switch needs transcript compaction.
+	 */
+	const windowCache = new Map();
+	const WINDOW_TTL = 10 * 60 * 1000;
+	const WINDOW_MISS_TTL = 60 * 1000;
+	/** Bound per-event lookups: the chain is small, a bare registry is not. */
+	const MAX_WINDOW_LOOKUPS = 24;
+
+	async function resolveWindow(provider, model) {
+		const key = routeKey(provider, model);
+		const now = Date.now();
+		const cached = windowCache.get(key);
+		if (cached !== undefined) {
+			const ttl = cached.value === undefined ? WINDOW_MISS_TTL : WINDOW_TTL;
+			if (now - cached.at < ttl) return cached.value;
+		}
+		let value;
+		try {
+			if (typeof ctx.llm.resolveModelInfo === "function") {
+				const info = await ctx.llm.resolveModelInfo(provider, model);
+				const window = info?.context?.contextWindow;
+				if (typeof window === "number" && window > 0) value = window;
+			}
+		} catch { /* adapter could not resolve this route */ }
+		if (value === undefined) {
+			try {
+				const models = await ctx.llm.listModels(provider);
+				const found = models.find((entry) => entry.id === model);
+				if (typeof found?.contextWindow === "number" && found.contextWindow > 0) value = found.contextWindow;
+			} catch { /* ignore */ }
+		}
+		windowCache.set(key, { value, at: now });
+		return value;
+	}
+
 	/** Look up a model's context window from the live registry (best effort). */
 	async function currentModelWindow(provider, model) {
 		if (!provider || !model) return undefined;
-		try {
-			const models = await ctx.llm.listModels(provider);
-			return models.find((m) => m.id === model)?.contextWindow;
-		} catch {
-			return undefined;
-		}
+		return resolveWindow(provider, model);
 	}
 
 	/** One tiny real request to verify a candidate actually works right now. */
@@ -867,7 +906,13 @@ export async function apply(ctx, rawConfig) {
 					.map(([route, until]) => ({ route, reason: "context compaction failed", secondsLeft: Math.round((until - Date.now()) / 1000) })),
 				suspended: [...switchSuspended.entries()]
 					.filter(([, until]) => until > Date.now())
-					.map(([agentId, until]) => ({ agentId, reason: "compaction deadlock", secondsLeft: Math.round((until - Date.now()) / 1000) }))
+					.map(([agentId, until]) => ({ agentId, reason: "compaction deadlock", secondsLeft: Math.round((until - Date.now()) / 1000) })),
+				// Windows the plugin actually resolved (listModels reports none).
+				windows: Object.fromEntries(
+					[...windowCache.entries()]
+						.filter(([, entry]) => typeof entry.value === "number")
+						.map(([route, entry]) => [route, entry.value])
+				)
 			};
 		};
 		const writeState = async (body) => {
